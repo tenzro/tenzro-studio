@@ -116,6 +116,7 @@ pub fn run() {
             node_lifecycle::node_status,
             node_lifecycle::request_role_change,
             node_lifecycle::restart_node,
+            node_lifecycle::reset_local_chain,
             rpc_bridge::rpc_call,
             rpc_bridge::sidecar_chat,
             rpc_bridge::sidecar_load_model,
@@ -170,6 +171,50 @@ pub fn run() {
                     tracing::error!("Node auto-start failed: {}", e);
                 }
             });
+
+            // Unix signal handler — RunEvent::ExitRequested only fires for UI
+            // quits (Cmd-Q, window close). A SIGTERM/SIGINT/SIGHUP from
+            // outside (terminal kill, parent process death, system shutdown,
+            // crash recovery) would otherwise bypass graceful_shutdown and
+            // orphan the llama-server sidecar — see the orphaned-sidecar
+            // bug. Listen for those signals and call exit(), which then
+            // routes through the normal ExitRequested path.
+            #[cfg(unix)]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let mut sigterm = match signal(SignalKind::terminate()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("SIGTERM listener install failed: {}", e);
+                            return;
+                        }
+                    };
+                    let mut sigint = match signal(SignalKind::interrupt()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("SIGINT listener install failed: {}", e);
+                            return;
+                        }
+                    };
+                    let mut sighup = match signal(SignalKind::hangup()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("SIGHUP listener install failed: {}", e);
+                            return;
+                        }
+                    };
+                    let sig = tokio::select! {
+                        _ = sigterm.recv() => "SIGTERM",
+                        _ = sigint.recv() => "SIGINT",
+                        _ = sighup.recv() => "SIGHUP",
+                    };
+                    tracing::info!("Received {} — requesting app exit", sig);
+                    handle.exit(0);
+                });
+            }
+
             Ok(())
         })
         .build(tauri::generate_context!())

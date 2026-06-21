@@ -244,6 +244,57 @@ pub async fn request_role_change(
     Err("Role change not yet implemented in this wave".to_string())
 }
 
+/// Wipe local chain state and restart the node. Required after a
+/// testnet rollback (the network's tip moved backward to a fresh
+/// genesis — common during testnet sweeps) because the client carries
+/// stale RocksDB state at a height the network no longer recognises,
+/// causing libp2p identify-handshake failures and persistent "0 peers"
+/// even when the bootstrap DNS resolves.
+///
+/// Wipes: `db/` (RocksDB — consensus + blocks + everything), `snapshots/`.
+/// Preserves: all keys (`p2p_key`, `auth_secret.bin`, `validator_*_key`),
+/// `agent_memory/`, `wallets/`. Peer ID and validator identity survive.
+///
+/// Caller is responsible for confirming with the user — this is
+/// destructive (any pending local-only state is lost, though there
+/// shouldn't be any for a ModelProvider).
+#[tauri::command]
+pub async fn reset_local_chain(state: State<'_, AppState>) -> Result<(), String> {
+    tracing::warn!("Local chain reset requested — wiping db/ and snapshots/");
+
+    // Graceful shutdown first — RocksDB must release its handle before
+    // we can rm -rf the dir.
+    let prev = {
+        let mut guard = state.node.write().await;
+        guard.take()
+    };
+    if let Some(handle) = prev {
+        unload_all_models_inner(&handle).await;
+        if let Err(e) = handle.shutdown_and_wait().await {
+            tracing::warn!("Previous node shutdown error on chain reset: {}", e);
+        }
+    }
+
+    let home = dirs::home_dir()
+        .ok_or_else(|| "could not resolve home directory".to_string())?;
+    let data_dir = home.join(".tenzro").join("inference");
+    for sub in ["db", "snapshots"] {
+        let path = data_dir.join(sub);
+        if path.exists() {
+            tracing::info!("Removing {}", path.display());
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                tracing::warn!("Failed to remove {}: {}", path.display(), e);
+                return Err(format!("failed to remove {}: {}", path.display(), e));
+            }
+        }
+    }
+
+    // Fresh node start — auto_start_node also runs clear_stale_state_on_boot
+    // which is a no-op now that we just wiped, but stays correct if the
+    // wipe gets interrupted.
+    auto_start_node(&state).await
+}
+
 /// Force-restart the embedded node. The UI surfaces this as a "Retry
 /// connection" affordance when the status bar has been "connecting" too
 /// long (typically because the previous run died mid-dial and left

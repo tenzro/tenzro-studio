@@ -26,7 +26,10 @@
     "shortDescription": "Run, serve, and contribute AI to the Tenzro Network",
     "longDescription": "Ipnops Edge runs an embedded Tenzro node so any home user can download AI models from the Tenzro registry, run them locally with GPU acceleration, serve them to the network as a provider, and contribute compute to decentralized training runs — all from one bundled installer with no manual setup.",
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "entitlements": "entitlements.plist",
+      "signingIdentity": null,
+      "hardenedRuntime": true
     },
     "windows": {
       "wix": {
