@@ -1,0 +1,18 @@
+Tenzro Studio
+Copyright 2026 Tenzro Labs
+
+This product includes software developed by:
+
+- The Tenzro Network project (tenzro-node, tenzro-network, tenzro-model,
+  tenzro-types) — Apache License 2.0.
+- llama.cpp (https://github.com/ggml-org/llama.cpp) — MIT License.
+  Bundled as the `llama-server` sidecar executable.
+- Tauri (https://tauri.app) — MIT OR Apache 2.0.
+- React (https://react.dev) — MIT License.
+- Various other open-source dependencies — see Cargo.lock and
+  package-lock.json (or pnpm-lock.yaml) for the full set.
+
+This product redistributes vendored chat-template fixes for Qwen 3.5 /
+Qwen 3.6 from froggeric/Qwen-Fixed-Chat-Templates
+(https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates), licensed
+under the same terms as the upstream Qwen template (Apache 2.0).

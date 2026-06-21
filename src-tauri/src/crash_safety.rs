@@ -21,7 +21,7 @@
 //!
 //! Fingerprint of any of the above: the `llama-server` sidecar subprocess
 //! is left with `ppid=1` (reparented to launchd), no stderr panic line,
-//! no `~/Library/Logs/DiagnosticReports/Ipnops*.ips`, just a vanished PID.
+//! no `~/Library/Logs/DiagnosticReports/Tenzro Studio*.ips`, just a vanished PID.
 //!
 //! This module installs THREE layers of defence:
 //!

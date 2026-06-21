@@ -94,14 +94,14 @@ const CARDS: Card[] = [
     tagline: "Chat with models served by the network",
     body:
       "Pick a model from the network catalog, chat, pay per token. " +
-      "Lowest barrier — no GPU required, no local downloads.",
+      "No GPU required, no local downloads.",
   },
   {
     id: "run-local",
     title: "Run AI locally",
     tagline: "Download a model, chat in private",
     body:
-      "Download a GGUF model from the registry, run it on your machine " +
+      "Download a model from the registry, run it on your machine " +
       "with Metal / CUDA / ROCm acceleration. Stays on your device.",
   },
   {
@@ -110,15 +110,15 @@ const CARDS: Card[] = [
     tagline: "Earn TNZO by serving models you run",
     body:
       "Pick a model, advertise it to the network as a provider, " +
-      "earn TNZO from inference traffic. Requires capable hardware.",
+      "earn TNZO from AI requests. Requires capable hardware.",
   },
   {
     id: "validate",
     title: "Run a validator",
-    tagline: "Stake TNZO and produce blocks",
+    tagline: "Deposit TNZO and help secure the network",
     body:
-      "Advanced. Stake TNZO, participate in HotStuff-2 consensus, " +
-      "earn validator rewards. Requires uptime + a stake bond.",
+      "Advanced. Deposit TNZO, help secure the network, " +
+      "earn validator rewards. Requires uptime + a refundable deposit.",
   },
 ];
 
@@ -181,7 +181,7 @@ export default function Home() {
       <main className="mx-auto w-full max-w-5xl flex-1 px-8 pt-16">
         <header className="mb-12">
           <h1 className="text-3xl font-semibold tracking-tight">
-            Ipnops Edge
+            Tenzro Studio
           </h1>
           <p className="mt-2 text-sm text-muted-foreground">
             Run, serve, and contribute AI to the Tenzro Network.
@@ -373,12 +373,11 @@ function CardFlow({ cardId, onBack, status }: CardFlowProps) {
           {cardId === "run-local" && <RunLocalFlow />}
           {cardId === "serve" && <Placeholder>
             Pick a model you've downloaded, set pricing, register as a
-            provider, start earning from inference traffic routed to
-            your node.
+            provider, start earning from AI requests routed to your node.
           </Placeholder>}
           {cardId === "validate" && <Placeholder>
-            Stake TNZO, generate validator keys (Ed25519 + ML-DSA-65 +
-            BLS), submit a join request, participate in consensus once
+            Deposit TNZO, generate validator keys (Ed25519 + ML-DSA-65 +
+            BLS), submit a join request, help secure the network once
             admitted at the next epoch.
           </Placeholder>}
         </div>
@@ -1808,7 +1807,7 @@ function LocalModelPane({
               : !engineReady
                 ? engineLoading
                   ? "Loading model into memory…"
-                  : "Starting inference engine…"
+                  : "Starting AI engine…"
                 : undefined
           }
         />

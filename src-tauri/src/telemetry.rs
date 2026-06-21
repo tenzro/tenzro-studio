@@ -1,13 +1,13 @@
 //! Opt-in crash telemetry — DSN baked at build time via
-//! `IPNOPS_SENTRY_DSN`; runtime opt-in via the
+//! `TENZRO_STUDIO_SENTRY_DSN`; runtime opt-in via the
 //! `~/.tenzro/inference/telemetry.enabled` sentinel file. A fresh
 //! install sends nothing without explicit user consent.
 
 /// DSN baked at build time. Distribution builds set this via
-/// `IPNOPS_SENTRY_DSN=<dsn> cargo tauri build`; dev / unset = `None`,
+/// `TENZRO_STUDIO_SENTRY_DSN=<dsn> cargo tauri build`; dev / unset = `None`,
 /// in which case `init` returns `None` and the app sends no telemetry
 /// regardless of the user's opt-in state.
-pub const SENTRY_DSN: Option<&str> = option_env!("IPNOPS_SENTRY_DSN");
+pub const SENTRY_DSN: Option<&str> = option_env!("TENZRO_STUDIO_SENTRY_DSN");
 
 /// Path to the user-consent sentinel. Existence (any content) means
 /// the user opted in to telemetry; absence means they have not.

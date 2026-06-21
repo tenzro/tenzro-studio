@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
-  "productName": "Ipnops Edge",
+  "productName": "Tenzro Studio",
   "version": "0.1.0",
-  "identifier": "com.ipnops.edge",
+  "identifier": "com.tenzro.studio",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -27,7 +27,7 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "Run, serve, and contribute AI to the Tenzro Network",
-    "longDescription": "Ipnops Edge runs an embedded Tenzro node so any home user can download AI models from the Tenzro registry, run them locally with GPU acceleration, serve them to the network as a provider, and contribute compute to decentralized training runs — all from one bundled installer with no manual setup.",
+    "longDescription": "Tenzro Studio runs an embedded Tenzro node so any user can download AI models from the Tenzro registry, run them locally with GPU acceleration, serve them to the network as a provider, and contribute compute to decentralized training runs — all from one bundled installer with no manual setup.",
     "macOS": {
       "minimumSystemVersion": "11.0",
       "entitlements": "entitlements.plist",
@@ -51,7 +51,7 @@
   "app": {
     "windows": [
       {
-        "title": "Ipnops Edge",
+        "title": "Tenzro Studio",
         "width": 1280,
         "height": 820,
         "minWidth": 980,
@@ -81,7 +81,7 @@
       "active": true,
       "pubkey": "PUT_TAURI_UPDATER_PUBKEY_HERE",
       "endpoints": [
-        "https://ipnops.xyz/edge/updates/{{target}}/{{arch}}/{{current_version}}"
+        "https://tenzro.com/studio/updates/{{target}}/{{arch}}/{{current_version}}"
       ],
       "windows": {
         "installMode": "passive"

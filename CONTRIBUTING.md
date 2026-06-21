@@ -1,8 +1,8 @@
-# Contributing to Ipnops Edge
+# Contributing to Tenzro Studio
 
 ## Local development against an unreleased `tenzro-node`
 
-Ipnops Edge depends on `tenzro-node` from crates.io. While
+Tenzro Studio depends on `tenzro-node` from crates.io. While
 `tenzro-node` is pre-release and not yet published, contributors who want
 to test against changes in the tenzro-network monorepo at
 the same time can wire the local checkout in without modifying this
@@ -34,4 +34,4 @@ repo's `Cargo.toml`:
 
 ## Reporting issues
 
-Open an issue at <https://github.com/hilarl/ipnops-edge/issues>.
+Open an issue at <https://github.com/tenzro/tenzro-studio/issues>.

@@ -1,4 +1,4 @@
-//! Ipnops Edge — Tauri backend.
+//! Tenzro Studio — Tauri backend.
 //!
 //! On launch, the embedded Tenzro node spawns in the background and
 //! auto-dials the testnet bootstrap peers. The llama.cpp inference
@@ -83,7 +83,7 @@ pub fn run() {
     crash_safety::install_safety_net();
 
     // Opt-in crash telemetry. Initialised ONLY when (a) a DSN was
-    // baked into the build via IPNOPS_SENTRY_DSN at compile time AND
+    // baked into the build via TENZRO_STUDIO_SENTRY_DSN at compile time AND
     // (b) the user has explicitly opted in by creating the sentinel
     // file ~/.tenzro/inference/telemetry.enabled. A fresh install
     // sends nothing without explicit user consent. The returned
@@ -317,7 +317,7 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("error while building ipnops-edge");
+        .expect("error while building tenzro-studio");
 
     // Both `RunEvent::ExitRequested` (Cmd-Q / Quit menu / AppKit
     // termination) and `WindowEvent::CloseRequested` (window X /

@@ -1,12 +1,12 @@
 [package]
-name = "ipnops-edge"
+name = "tenzro-studio"
 version = "0.1.0"
 edition = "2024"
-description = "Ipnops Edge — run, serve, and contribute AI to the Tenzro Network"
-license = "LicenseRef-Proprietary"
+description = "Tenzro Studio — run, serve, and contribute AI to the Tenzro Network"
+license = "Apache-2.0"
 publish = false
-repository = "https://github.com/hilarl/ipnops-edge"
-homepage = "https://ipnops.xyz"
+repository = "https://github.com/tenzro/tenzro-studio"
+homepage = "https://tenzro.com"
 
 # Empty [workspace] isolates this app from any parent workspace so the
 # bundle builds the same way whether the repo is cloned standalone or
@@ -56,7 +56,7 @@ libc = "0.2"
 # Opt-in crash + error telemetry. DEFAULT OFF — only initialised when
 # `~/.tenzro/inference/telemetry.enabled` exists, so a fresh install
 # sends nothing without explicit user consent. DSN read from the
-# IPNOPS_SENTRY_DSN env var at build time (None at compile = no-op).
+# TENZRO_STUDIO_SENTRY_DSN env var at build time (None at compile = no-op).
 sentry = { version = "0.48", default-features = false, features = ["reqwest", "rustls", "backtrace", "contexts", "panic"] }
 sentry-tracing = "0.48"
 dirs = "5"
@@ -80,7 +80,7 @@ tenzro-types = "0.1"
 tenzro-model = "0.1"
 
 # Embedded Tenzro node. Distribution model: the installer ships a
-# compiled-in tenzro-node so the home user never installs or runs the
+# compiled-in tenzro-node so the user never installs or runs the
 # node binary themselves. Pinned to a published version so this
 # Cargo.toml resolves cleanly from a fresh clone.
 #
