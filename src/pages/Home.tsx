@@ -945,9 +945,12 @@ function RunLocalFlow() {
   );
 }
 
-/** A single model row in the Run-AI-Locally catalog. The main body
- *  click opens the chat pane; per-row action buttons (Details, Offload)
- *  stop propagation so they don't trigger the chat-open.
+/** A single model row in the Run-AI-Locally catalog. Chat opens on
+ *  click of the body; per-row action buttons (Details, Offload) use
+ *  capture-phase stopPropagation so they fire before — not after — the
+ *  body's bubbling onClick reaches the row container. Confirmation
+ *  uses inline React state (not window.confirm) so WebView-blocked
+ *  native dialogs don't silently no-op the button.
  *
  *  Offload requires the model be on disk AND not currently loaded into
  *  the per-model sidecar — the backend enforces both and returns a
@@ -963,87 +966,150 @@ function ModelRow({
   onShowDetails: () => void;
   onOffloaded: () => void;
 }) {
-  const [offloading, setOffloading] = useState(false);
+  const [phase, setPhase] = useState<"idle" | "confirm" | "offloading" | "done">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [freed, setFreed] = useState<number>(0);
 
-  async function offload(e: React.MouseEvent) {
-    e.stopPropagation();
-    const sizeHint = model.size_bytes
-      ? ` (${(model.size_bytes / 1024 / 1024 / 1024).toFixed(2)} GB)`
-      : "";
-    const ok = window.confirm(
-      `Offload ${model.name}${sizeHint}?\n\n` +
-        "This removes the GGUF file from your disk. You can re-download it any time from the catalog. " +
-        "If the model is currently loaded into the inference engine, stop the chat first.",
-    );
-    if (!ok) return;
-    setOffloading(true);
+  async function doOffload() {
+    setPhase("offloading");
+    setError(null);
     try {
-      const freed = await invoke<number>("offload_model", { id: model.id });
-      const gb = freed / 1024 / 1024 / 1024;
-      window.alert(`Freed ${gb.toFixed(2)} GB.`);
-      // Refresh the sidecar so the router stops advertising this model.
+      const f = await invoke<number>("offload_model", { id: model.id });
+      setFreed(f);
+      setPhase("done");
       try {
         await invoke("sidecar_refresh_models");
       } catch (e) {
         console.warn("sidecar_refresh_models after offload failed:", e);
       }
-      onOffloaded();
+      // Brief done-state so the user sees confirmation; then bubble up.
+      setTimeout(() => {
+        onOffloaded();
+      }, 800);
     } catch (e) {
-      window.alert(`Offload failed: ${String(e)}`);
-    } finally {
-      setOffloading(false);
+      setError(String(e));
+      setPhase("idle");
     }
   }
 
+  // Capture-phase handlers on action buttons so React fires them
+  // BEFORE the body's bubbling onClick reaches the row container.
+  // Plus stopPropagation as a belt-and-braces guard.
+  const stopAll = (e: React.MouseEvent | React.PointerEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+  };
+
   return (
-    <div
-      onClick={onPick}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") onPick();
-      }}
-      className="w-full cursor-pointer border border-border bg-card p-4 text-left transition hover:bg-accent"
-    >
-      <div className="flex items-baseline justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-medium">{model.name}</span>
-            {model.downloaded && <DownloadedBadge />}
+    <div className="w-full border border-border bg-card transition hover:bg-accent">
+      <button
+        type="button"
+        onClick={onPick}
+        className="block w-full p-4 text-left"
+      >
+        <div className="flex items-baseline justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium">{model.name}</span>
+              {model.downloaded && <DownloadedBadge />}
+            </div>
+            <div className="mt-0.5 text-xs text-muted-foreground">
+              {model.family} · {model.parameters} ·{" "}
+              {model.context_length.toLocaleString()} ctx
+              {model.quantization ? ` · ${model.quantization}` : ""}
+            </div>
           </div>
-          <div className="mt-0.5 text-xs text-muted-foreground">
-            {model.family} · {model.parameters} ·{" "}
-            {model.context_length.toLocaleString()} ctx
-            {model.quantization ? ` · ${model.quantization}` : ""}
-          </div>
+          <SizeTag bytes={model.size_bytes} minRam={model.min_ram_gb} />
         </div>
-        <SizeTag bytes={model.size_bytes} minRam={model.min_ram_gb} />
-      </div>
-      {model.description && (
-        <p className="mt-2 text-sm text-muted-foreground">
-          {model.description}
-        </p>
-      )}
-      <div className="mt-3 flex items-center justify-end gap-2">
+        {model.description && (
+          <p className="mt-2 text-sm text-muted-foreground">
+            {model.description}
+          </p>
+        )}
+      </button>
+      <div
+        className="flex items-center justify-end gap-2 border-t border-border bg-card/60 px-4 py-2"
+        // Action bar is outside the chat-open button so clicks here
+        // physically cannot reach the chat-open handler.
+      >
+        {error && (
+          <span className="mr-auto text-xs text-destructive">
+            {error}
+            <button
+              type="button"
+              onClick={() => setError(null)}
+              className="ml-2 underline hover:no-underline"
+            >
+              dismiss
+            </button>
+          </span>
+        )}
+        {phase === "done" && (
+          <span className="mr-auto text-xs text-emerald-600 dark:text-emerald-400">
+            Freed {(freed / 1024 / 1024 / 1024).toFixed(2)} GB
+          </span>
+        )}
         <button
+          type="button"
+          onPointerDown={stopAll}
           onClick={(e) => {
-            e.stopPropagation();
+            stopAll(e);
             onShowDetails();
           }}
           className="border border-border bg-secondary px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent"
-          title="Show full model details (catalog metadata, on-disk size, runtime policy)"
+          title="Show full model details"
         >
           Details
         </button>
-        {model.downloaded && (
+        {model.downloaded && phase === "idle" && (
           <button
-            onClick={offload}
-            disabled={offloading}
-            className="border border-amber-600/40 bg-amber-600/10 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-amber-200 hover:bg-amber-600/20 disabled:opacity-50"
-            title="Remove this model from disk to reclaim space. The catalog entry stays — you can re-download anytime."
+            type="button"
+            onPointerDown={stopAll}
+            onClick={(e) => {
+              stopAll(e);
+              setPhase("confirm");
+            }}
+            className="border border-amber-600/40 bg-amber-600/10 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-amber-700 dark:text-amber-300 hover:bg-amber-600/20"
+            title="Remove this model from disk to reclaim space."
           >
-            {offloading ? "Offloading…" : "Offload"}
+            Offload
           </button>
+        )}
+        {phase === "confirm" && (
+          <>
+            <span className="mr-auto text-xs text-muted-foreground">
+              Free{" "}
+              {model.size_bytes
+                ? `${(model.size_bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+                : "this model"}
+              ?
+            </span>
+            <button
+              type="button"
+              onPointerDown={stopAll}
+              onClick={(e) => {
+                stopAll(e);
+                setPhase("idle");
+              }}
+              className="border border-border bg-secondary px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onPointerDown={stopAll}
+              onClick={(e) => {
+                stopAll(e);
+                doOffload();
+              }}
+              className="border border-amber-600/40 bg-amber-600 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-white hover:bg-amber-700"
+            >
+              Confirm offload
+            </button>
+          </>
+        )}
+        {phase === "offloading" && (
+          <span className="text-xs text-muted-foreground">Offloading…</span>
         )}
       </div>
     </div>
@@ -1084,19 +1150,15 @@ function ModelDetailsModal({
     };
   }, [id]);
 
-  async function offload() {
+  const [confirming, setConfirming] = useState(false);
+  const [offloadError, setOffloadError] = useState<string | null>(null);
+
+  async function doOffload() {
     if (!data?.local?.downloaded) return;
-    const gb = (data.local.on_disk_bytes / 1024 / 1024 / 1024).toFixed(2);
-    if (
-      !window.confirm(
-        `Offload ${data.name} (${gb} GB)? You can re-download anytime from the catalog.`,
-      )
-    )
-      return;
     setOffloading(true);
+    setOffloadError(null);
     try {
-      const freed = await invoke<number>("offload_model", { id });
-      window.alert(`Freed ${(freed / 1024 / 1024 / 1024).toFixed(2)} GB.`);
+      await invoke<number>("offload_model", { id });
       try {
         await invoke("sidecar_refresh_models");
       } catch (e) {
@@ -1104,8 +1166,9 @@ function ModelDetailsModal({
       }
       onOffloaded();
     } catch (e) {
-      window.alert(`Offload failed: ${String(e)}`);
+      setOffloadError(String(e));
       setOffloading(false);
+      setConfirming(false);
     }
   }
 
@@ -1242,22 +1305,50 @@ function ModelDetailsModal({
                 )}
               </Section>
             )}
-            <div className="flex justify-end pt-2">
-              {data.local.downloaded && (
+            <div className="flex items-center justify-end gap-2 pt-2">
+              {offloadError && (
+                <span className="mr-auto text-xs text-destructive">
+                  {offloadError}
+                </span>
+              )}
+              {data.local.downloaded && !confirming && !offloading && (
                 <button
-                  onClick={offload}
-                  disabled={offloading || data.local.loaded_in_sidecar}
-                  className="border border-amber-600/40 bg-amber-600/10 px-3 py-1.5 text-xs font-medium uppercase tracking-wider text-amber-200 hover:bg-amber-600/20 disabled:opacity-50"
+                  type="button"
+                  onClick={() => setConfirming(true)}
+                  disabled={data.local.loaded_in_sidecar}
+                  className="border border-amber-600/40 bg-amber-600/10 px-3 py-1.5 text-xs font-medium uppercase tracking-wider text-amber-700 dark:text-amber-300 hover:bg-amber-600/20 disabled:opacity-50"
                   title={
                     data.local.loaded_in_sidecar
                       ? "Stop the chat first — the model is currently loaded."
                       : "Free disk space by removing this model. Re-download anytime."
                   }
                 >
-                  {offloading
-                    ? "Offloading…"
-                    : `Offload (${formatGB(data.local.on_disk_bytes)})`}
+                  Offload ({formatGB(data.local.on_disk_bytes)})
                 </button>
+              )}
+              {confirming && !offloading && (
+                <>
+                  <span className="mr-auto text-xs text-muted-foreground">
+                    Free {formatGB(data.local.on_disk_bytes)}? You can re-download anytime.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setConfirming(false)}
+                    className="border border-border bg-secondary px-3 py-1.5 text-xs font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={doOffload}
+                    className="border border-amber-600/40 bg-amber-600 px-3 py-1.5 text-xs font-medium uppercase tracking-wider text-white hover:bg-amber-700"
+                  >
+                    Confirm offload
+                  </button>
+                </>
+              )}
+              {offloading && (
+                <span className="text-xs text-muted-foreground">Offloading…</span>
               )}
             </div>
           </div>
