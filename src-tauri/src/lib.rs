@@ -13,6 +13,7 @@ mod node_lifecycle;
 mod rpc_bridge;
 mod sidecar;
 mod streaming;
+mod telemetry;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,6 +71,14 @@ fn init_logging() -> Option<LogGuard> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Opt-in crash telemetry. Initialised ONLY when (a) a DSN was
+    // baked into the build via IPNOPS_SENTRY_DSN at compile time AND
+    // (b) the user has explicitly opted in by creating the sentinel
+    // file ~/.tenzro/inference/telemetry.enabled. A fresh install
+    // sends nothing without explicit user consent. The returned
+    // ClientInitGuard MUST outlive the app — drop = flush + shutdown.
+    let sentry_guard = telemetry::init();
+
     // Dual sink: stderr (for `tauri dev` + `Console.app` capture) AND
     // a daily-rotated file under ~/.tenzro/inference/logs/edge.log so
     // user crash reports include the full run-up to a failure. The
@@ -82,8 +91,15 @@ pub fn run() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    // Sentry breadcrumbs from tracing — only active when sentry is
+    // initialised (no DSN or no opt-in = the layer is still wired but
+    // sentry::capture_* are no-ops).
+    let sentry_layer = sentry_tracing::layer();
 
-    let registry = tracing_subscriber::registry().with(env_filter).with(stderr_layer);
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stderr_layer)
+        .with(sentry_layer);
     if let Some(file_writer) = log_guard.as_ref().map(|g| g.writer.clone()) {
         let file_layer = tracing_subscriber::fmt::layer()
             .with_ansi(false)
@@ -95,6 +111,14 @@ pub fn run() {
     // Keep the guard alive for the lifetime of the process; dropping
     // it would close the appender background thread mid-app.
     if let Some(g) = log_guard {
+        Box::leak(Box::new(g));
+    }
+    // Same lifetime story for the sentry guard. ClientInitGuard's Drop
+    // flushes + shuts down the transport — we want that to happen on
+    // process exit, not on run()'s frame teardown (which is right after
+    // `app.run` returns, an instant before the process exits anyway,
+    // but leaking is the canonical pattern).
+    if let Some(g) = sentry_guard {
         Box::leak(Box::new(g));
     }
 
@@ -164,6 +188,8 @@ pub fn run() {
             node_lifecycle::request_role_change,
             node_lifecycle::restart_node,
             node_lifecycle::reset_local_chain,
+            telemetry::telemetry_state,
+            telemetry::set_telemetry_enabled,
             rpc_bridge::rpc_call,
             rpc_bridge::sidecar_chat,
             rpc_bridge::sidecar_load_model,

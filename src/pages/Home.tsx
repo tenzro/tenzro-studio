@@ -237,6 +237,14 @@ function StatusBar({ status }: { status: NodeStatus | null }) {
   // died mid-dial and left libp2p state in a confused position — a
   // clean restart of just the node usually fixes it.
   const showRetry = status.connectivity === "connecting" && status.uptime_secs > 30;
+  // Escalate to a chain-reset offer when Retry alone hasn't helped: if
+  // we've been "connecting" for >120 s with zero peers, the local
+  // RocksDB is almost certainly carrying state above the network's
+  // current genesis (testnet sweep / rollback). Retry alone can't fix
+  // that — only wiping db/ + snapshots/ will, because the libp2p
+  // identify handshake against the fleet rejects us on the
+  // chain-id/height mismatch.
+  const showReset = status.connectivity === "connecting" && status.uptime_secs > 120;
 
   async function retry() {
     if (restarting) return;
@@ -248,6 +256,30 @@ function StatusBar({ status }: { status: NodeStatus | null }) {
     } finally {
       // status poll will reflect the new node — just clear the local
       // "restarting" flag after a beat so the spinner state ends.
+      setTimeout(() => setRestarting(false), 1500);
+    }
+  }
+
+  async function resetChain() {
+    if (restarting) return;
+    const ok = window.confirm(
+      "Reset local chain state?\n\n" +
+        "Your node has been unable to connect for over 2 minutes. " +
+        "The network may have been reset to a new genesis (common during " +
+        "testnet sweeps), in which case your local chain data is " +
+        "incompatible and must be wiped to reconnect.\n\n" +
+        "This wipes: chain database + snapshots.\n" +
+        "Preserved: your keys, wallets, agent memory, downloaded models.\n\n" +
+        "Proceed?"
+    );
+    if (!ok) return;
+    setRestarting(true);
+    try {
+      await invoke("reset_local_chain");
+    } catch (e) {
+      console.error("reset_local_chain failed:", e);
+      window.alert("Chain reset failed: " + String(e));
+    } finally {
       setTimeout(() => setRestarting(false), 1500);
     }
   }
@@ -276,7 +308,7 @@ function StatusBar({ status }: { status: NodeStatus | null }) {
       <span className="text-muted-foreground/70">
         Uptime {Math.floor(status.uptime_secs / 60)}m
       </span>
-      {showRetry && (
+      {showRetry && !showReset && (
         <>
           <Sep />
           <button
@@ -285,6 +317,26 @@ function StatusBar({ status }: { status: NodeStatus | null }) {
             className="border border-border bg-secondary px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent disabled:opacity-50"
           >
             {restarting ? "Restarting…" : "Retry connection"}
+          </button>
+        </>
+      )}
+      {showReset && (
+        <>
+          <Sep />
+          <button
+            onClick={retry}
+            disabled={restarting}
+            className="border border-border bg-secondary px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent disabled:opacity-50"
+          >
+            {restarting ? "Restarting…" : "Retry"}
+          </button>
+          <button
+            onClick={resetChain}
+            disabled={restarting}
+            className="border border-amber-600/40 bg-amber-600/10 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-amber-200 hover:bg-amber-600/20 disabled:opacity-50"
+            title="Wipe local chain data and reconnect — needed after a network genesis reset"
+          >
+            Reset local chain
           </button>
         </>
       )}

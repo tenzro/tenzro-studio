@@ -75,11 +75,14 @@
       "open": true
     },
     "updater": {
-      "active": false,
-      "pubkey": "",
+      "active": true,
+      "pubkey": "PUT_TAURI_UPDATER_PUBKEY_HERE",
       "endpoints": [
         "https://ipnops.xyz/edge/updates/{{target}}/{{arch}}/{{current_version}}"
-      ]
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }
