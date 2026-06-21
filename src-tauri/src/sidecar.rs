@@ -431,44 +431,6 @@ fn pick_free_port() -> Result<u16, String> {
     Ok(port)
 }
 
-/// Per-family chat-template overrides. Looked up against the catalog
-/// entry's `family` field (the SoT for "what kind of model is this") —
-/// NOT against the on-disk filename, because the same family ships
-/// under multiple filename conventions (lowercase id when downloaded
-/// via tenzro-node's HF downloader, mixed-case canonical Unsloth name
-/// when downloaded directly).
-///
-/// To add a new override:
-/// 1. Drop the fixed jinja into `src-tauri/templates/<file>.jinja`.
-/// 2. Add `("<family>", "<file>.jinja")` to this list, where
-///    `<family>` is the catalog `family` string (case-sensitive,
-///    matches the catalog as written).
-/// 3. The preset generator wires `--chat-template-file <path>` into
-///    that model's INI section on next spawn.
-///
-/// Currently vendored:
-/// - **qwen3.5 / qwen3.6** — froggeric v20 ("The Architect Patch",
-///   2026-06-05) fixes the prompt-drop bug (`content | replace(
-///   '<|think_on|>', '')` — minja's C++ replace filter silently drops
-///   the user prompt when matched at index 0). Symptom: model loads,
-///   accepts the request, generates tokens, every token renders to
-///   empty string, finish_reason ends `length`. The runaway-guard in
-///   streaming.rs ends the chat cleanly with "no readable output" but
-///   the user sees nothing. v20 also fixes an empty-think poisoning
-///   bug (~80% premature stall) and re-architects tool-call / kv-
-///   cache handling. ONE template covers every Qwen 3.5/3.6 size +
-///   both thinking and non-thinking modes (kwargs-driven).
-///   Source: https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
-///   Underlying minja bug: ggml-org/llama.cpp#13178
-///
-/// Note: Qwen 3 (original, pre-3.5) is a separate bug (the
-/// `messages[::-1]` slice that minja couldn't parse) already fixed
-/// upstream in llama.cpp PR #13573 — no vendored template needed.
-const TEMPLATE_OVERRIDES: &[(&str, &str)] = &[
-    ("qwen3.5", "qwen3.5-3.6-froggeric-v20.jinja"),
-    ("qwen3.6", "qwen3.5-3.6-froggeric-v20.jinja"),
-];
-
 /// Build a per-model preset INI from the GGUFs in `models_dir`.
 ///
 /// Each discovered GGUF is matched back to its catalog entry
@@ -497,38 +459,28 @@ async fn generate_models_preset(
     let ubatch_size = profile.ubatch_size(ctx_size);
     let threads = profile.threads();
 
-    // Index the catalog by EVERY plausible on-disk filename stem so the
-    // match works regardless of who downloaded the GGUF:
+    // Index the catalog by `download_filename` stem — the universal
+    // policy field that the catalog build pass derives from each
+    // entry's `id`. The downloader writes `~/.tenzro/models/<id>.gguf`,
+    // so the on-disk stem the router sees == the catalog `id`. Single
+    // key, no dual-index hacks. See docs/serving-policy.md.
     //
-    //   - `hf_filename` stem      — canonical Unsloth filename, e.g.
-    //                               "Qwen3.5-0.8B-Q4_K_M". The catalog
-    //                               author's official naming.
-    //   - catalog `id`            — what tenzro-node's HF downloader uses
-    //                               when it writes `~/.tenzro/models/<id>.gguf`,
-    //                               e.g. "qwen3.5-0.8b". Without this key
-    //                               the override + sampler block silently
-    //                               no-ops because the file on disk doesn't
-    //                               match the hf_filename stem. Observed
-    //                               symptom: model loads with stock embedded
-    //                               jinja + default samplers, multi-turn
-    //                               chats emit empty tokens (the upstream
-    //                               Qwen 3.5/3.6 prompt-drop bug).
-    //
-    // `hf_filename` may carry a sharded subdir prefix (e.g. `Q4_K_M/Model-
-    // ...-00001-of-000NN.gguf`); we key on the bare filename stem, which
-    // is what the router sees on disk.
+    // For sharded entries `download_filename` may carry the subdir
+    // prefix (handled by `rsplit('/')` below).
     use std::collections::HashMap;
-    use tenzro_model::catalog::{MtpKind, get_model_catalog};
+    use tenzro_model::catalog::{MtpKind, TemplateFix, get_model_catalog};
     let catalog = get_model_catalog();
     let mut by_stem: HashMap<String, &tenzro_model::catalog::HfModelEntry> =
         HashMap::new();
     for e in catalog.iter() {
-        if let Some(file) = e.hf_filename.rsplit('/').next()
-            && let Some(stem) = file.strip_suffix(".gguf")
-        {
-            by_stem.insert(stem.to_string(), e);
-        }
-        by_stem.insert(e.id.clone(), e);
+        let stem = e
+            .download_filename
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.strip_suffix(".gguf"))
+            .map(str::to_string)
+            .unwrap_or_else(|| e.id.clone());
+        by_stem.insert(stem, e);
     }
 
     let mut ini = String::new();
@@ -666,35 +618,32 @@ async fn generate_models_preset(
             }
         }
 
-        // Per-family template override. Looked up against the matched
-        // catalog entry's `family` field — the SoT for "what kind of
-        // model is this". Unmatched models (cat is None) fall through
-        // to the GGUF's embedded template, which is correct: we have
-        // no way to know if their jinja is broken.
+        // Chat-template fix — universal: catalog tells us whether THIS
+        // entry needs a vendored jinja, the client just resolves the
+        // logical filename to its bundled `templates/` dir. Unmatched
+        // models (cat is None) and entries with TemplateFix::None fall
+        // through to the GGUF's embedded template, which is correct.
         if let Some(c) = cat {
-            for (family, template_file) in TEMPLATE_OVERRIDES {
-                if c.family == *family {
-                    let tpl_path = templates_dir.join(template_file);
-                    if tpl_path.exists() {
-                        ini.push_str(&format!(
-                            "chat-template-file = {}\n",
-                            tpl_path.display()
-                        ));
-                        info!(
-                            "Applying chat-template override for {} (family={}): {}",
-                            stem,
-                            c.family,
-                            tpl_path.display()
-                        );
-                    } else {
-                        warn!(
-                            "Chat-template override missing for {} (family={}): {} (bundle is broken?)",
-                            stem,
-                            c.family,
-                            tpl_path.display()
-                        );
-                    }
-                    break;
+            if let TemplateFix::Vendored { filename } = &c.template_fix {
+                let tpl_path = templates_dir.join(filename);
+                if tpl_path.exists() {
+                    ini.push_str(&format!(
+                        "chat-template-file = {}\n",
+                        tpl_path.display()
+                    ));
+                    info!(
+                        "Applying vendored chat-template for {} (family={}): {}",
+                        stem,
+                        c.family,
+                        tpl_path.display()
+                    );
+                } else {
+                    warn!(
+                        "Vendored chat-template missing for {} (family={}): {} (bundle is broken?)",
+                        stem,
+                        c.family,
+                        tpl_path.display()
+                    );
                 }
             }
         }

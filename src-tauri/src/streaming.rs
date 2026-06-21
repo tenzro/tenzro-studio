@@ -112,39 +112,94 @@ fn is_model_not_found(body: &str) -> bool {
     b.contains("not found") && b.contains("model")
 }
 
-/// Wire the catalog's `reasoning_default` into the request as
-/// `chat_template_kwargs.enable_thinking` so the chat template renders
-/// thinking-on / thinking-off per the model's recommended default.
-/// Caller-supplied `chat_template_kwargs.enable_thinking` always wins.
+/// Resolve the catalog's `ReasoningPolicy` for this request and inject
+/// the appropriate `chat_template_kwargs.enable_thinking` boolean. If
+/// thinking would be ON but the caller's `max_tokens` budget is below
+/// the model's thinking-mode minimum, also bump `max_tokens` to the
+/// recommended floor — small budgets in thinking-mode are the
+/// documented Qwen3.5-0.8B/2B failure mode (model spends entire budget
+/// in `<think>`, emits empty content).
 ///
-/// Without this, every Qwen 3.5 / 3.6 request defaults to thinking-ON
-/// (the chat template's own default) regardless of what the catalog
-/// says. On small Qwen 3.5 (0.8B / 2B) this is documented-broken: the
-/// model enters thinking loops and consumes the entire token budget
-/// inside `<think>`, emitting empty content. See the per-id override
-/// in tenzro_model::catalog (qwen3.5-0.8b / qwen3.5-2b → reasoning_default=false)
-/// and the Qwen team's own warning on the 0.8B / 2B HF model cards.
-fn inject_reasoning_default(body: &mut Value) {
-    let Some(model_id) = body.get("model").and_then(|v| v.as_str()) else {
-        return;
+/// Universal: the policy lives in the catalog and is derived per-family
+/// + per-size by the catalog build pass. The runtime resolves it; no
+/// per-id app conditionals. See `docs/serving-policy.md`.
+///
+/// Caller-supplied `chat_template_kwargs.enable_thinking` always wins —
+/// this only injects when the caller didn't set it.
+fn inject_reasoning_policy(body: &mut Value) {
+    // Take an owned copy of the model id up-front so the rest of the
+    // function can mutate `body` without holding an immutable borrow.
+    let model_id: String = match body.get("model").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return,
     };
     let kwargs = body
         .get("chat_template_kwargs")
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
-    if kwargs.contains_key("enable_thinking") {
+    let caller_set_thinking = kwargs.contains_key("enable_thinking");
+
+    let Some(entry) = tenzro_model::catalog::get_model_by_id(&model_id) else {
+        // Unknown model id (local-only / off-catalog file) — nothing to inject.
+        return;
+    };
+
+    // Family doesn't support thinking mode at all. Don't touch the
+    // kwargs — the GGUF template handles its own behaviour.
+    if !entry.reasoning.supports_thinking {
+        return;
+    }
+
+    if caller_set_thinking {
         // Caller explicitly chose — honour it.
         return;
     }
-    let Some(entry) = tenzro_model::catalog::get_model_by_id(model_id) else {
-        return;
+
+    use tenzro_model::catalog::ReasoningMode;
+    let user_budget = body
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(DEFAULT_MAX_TOKENS as u32);
+
+    let size_b = tenzro_model::catalog::parse_params_active_b(&entry.parameters);
+    let size_ok = size_b >= entry.reasoning.thinking_safe_min_b;
+    let budget_ok = user_budget >= entry.reasoning.thinking_min_budget_tokens;
+
+    let thinking = match entry.reasoning.default_mode {
+        ReasoningMode::Always => true,
+        ReasoningMode::Never => false,
+        ReasoningMode::Auto => size_ok && budget_ok,
     };
-    let mut merged = kwargs;
-    merged.insert(
-        "enable_thinking".to_string(),
-        Value::Bool(entry.serving.reasoning_default),
+
+    tracing::info!(
+        model = model_id,
+        size_b,
+        user_budget,
+        thinking_safe_min_b = entry.reasoning.thinking_safe_min_b,
+        thinking_min_budget_tokens = entry.reasoning.thinking_min_budget_tokens,
+        size_ok,
+        budget_ok,
+        enable_thinking = thinking,
+        "reasoning policy resolved"
     );
+
+    // If thinking was requested by the catalog policy but the budget is
+    // too tight, defensively bump max_tokens so the model has room to
+    // actually emit content after its reasoning block.
+    if thinking && user_budget < entry.reasoning.thinking_min_budget_tokens {
+        body["max_tokens"] = Value::from(entry.reasoning.thinking_min_budget_tokens);
+        tracing::info!(
+            model = model_id,
+            from = user_budget,
+            to = entry.reasoning.thinking_min_budget_tokens,
+            "reasoning policy bumped max_tokens to thinking-min floor"
+        );
+    }
+
+    let mut merged = kwargs;
+    merged.insert("enable_thinking".to_string(), Value::Bool(thinking));
     body["chat_template_kwargs"] = Value::Object(merged);
 }
 
@@ -192,7 +247,7 @@ pub async fn sidecar_chat_stream(
         body["max_tokens"] = Value::from(DEFAULT_MAX_TOKENS);
     }
     inject_stop_strings(&mut body);
-    inject_reasoning_default(&mut body);
+    inject_reasoning_policy(&mut body);
 
     // Drive the stream, with a single retry on "model not found": that
     // 400 means the router booted before this model finished
