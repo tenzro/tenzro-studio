@@ -47,6 +47,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # crash reports include the run-up to the failure (stderr alone is
 # lost when the user closes the terminal or launches from Finder).
 tracing-appender = "0.2"
+# Crash safety: libc::atexit for the last-resort sidecar cleanup hook
+# that runs even when Rust panic propagation is bypassed (non-unwinding
+# panics in wry's WKWebView callbacks, process::exit, etc.). See
+# src/crash_safety.rs. futures-util is already declared above and is
+# also used by crash_safety / streaming for FutureExt::catch_unwind.
+libc = "0.2"
 # Opt-in crash + error telemetry. DEFAULT OFF — only initialised when
 # `~/.tenzro/inference/telemetry.enabled` exists, so a fresh install
 # sends nothing without explicit user consent. DSN read from the

@@ -112,6 +112,42 @@ fn is_model_not_found(body: &str) -> bool {
     b.contains("not found") && b.contains("model")
 }
 
+/// Wire the catalog's `reasoning_default` into the request as
+/// `chat_template_kwargs.enable_thinking` so the chat template renders
+/// thinking-on / thinking-off per the model's recommended default.
+/// Caller-supplied `chat_template_kwargs.enable_thinking` always wins.
+///
+/// Without this, every Qwen 3.5 / 3.6 request defaults to thinking-ON
+/// (the chat template's own default) regardless of what the catalog
+/// says. On small Qwen 3.5 (0.8B / 2B) this is documented-broken: the
+/// model enters thinking loops and consumes the entire token budget
+/// inside `<think>`, emitting empty content. See the per-id override
+/// in tenzro_model::catalog (qwen3.5-0.8b / qwen3.5-2b → reasoning_default=false)
+/// and the Qwen team's own warning on the 0.8B / 2B HF model cards.
+fn inject_reasoning_default(body: &mut Value) {
+    let Some(model_id) = body.get("model").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let kwargs = body
+        .get("chat_template_kwargs")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    if kwargs.contains_key("enable_thinking") {
+        // Caller explicitly chose — honour it.
+        return;
+    }
+    let Some(entry) = tenzro_model::catalog::get_model_by_id(model_id) else {
+        return;
+    };
+    let mut merged = kwargs;
+    merged.insert(
+        "enable_thinking".to_string(),
+        Value::Bool(entry.serving.reasoning_default),
+    );
+    body["chat_template_kwargs"] = Value::Object(merged);
+}
+
 /// Merge our ChatML stop markers into the request body's `stop` array
 /// without clobbering any caller-supplied stops.
 fn inject_stop_strings(body: &mut Value) {
@@ -156,6 +192,7 @@ pub async fn sidecar_chat_stream(
         body["max_tokens"] = Value::from(DEFAULT_MAX_TOKENS);
     }
     inject_stop_strings(&mut body);
+    inject_reasoning_default(&mut body);
 
     // Drive the stream, with a single retry on "model not found": that
     // 400 means the router booted before this model finished

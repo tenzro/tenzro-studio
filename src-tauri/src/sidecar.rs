@@ -58,6 +58,10 @@ impl SidecarHandle {
         let Some(mut child) = guard.take() else {
             return;
         };
+        // Clear the crash_safety PID registry first so the atexit
+        // handler doesn't race us into a waitpid on an already-reaped
+        // process if the app exits while stop() is in flight.
+        crate::crash_safety::forget_sidecar_pid();
         // tokio's `kill()` is SIGKILL on Unix; for graceful first we
         // shell out to `kill -TERM <pid>`. If pid is unavailable
         // (already-exited race) just skip to SIGKILL.
@@ -239,6 +243,15 @@ pub async fn spawn_sidecar(app: &AppHandle) -> Result<Arc<SidecarHandle>, String
         .spawn()
         .map_err(|e| format!("failed to spawn llama-server: {}", e))?;
 
+    // Register the PID with crash_safety so the panic hook / atexit
+    // handler / alloc-error hook can SIGTERM+SIGKILL the sidecar even
+    // when Rust panic propagation is bypassed (wry non-unwinding
+    // panics, process::exit, double-Drop). Without this the sidecar
+    // would orphan with ppid=1 — the documented silent-death symptom.
+    if let Some(pid) = child.id() {
+        crate::crash_safety::register_sidecar_pid(pid);
+    }
+
     let base_url = format!("http://127.0.0.1:{}", port);
     let healthy = wait_for_health(&base_url, std::time::Duration::from_secs(15)).await;
     if !healthy {
@@ -418,43 +431,42 @@ fn pick_free_port() -> Result<u16, String> {
     Ok(port)
 }
 
-/// Known-broken chat-template prefixes. Each prefix in this list is
-/// matched against the GGUF stem (filename without `.gguf`) — when
-/// present, we override the GGUF's embedded jinja template with our
-/// vendored fix. Sources: llama.cpp #13178, froggeric/Qwen-Fixed-Chat-
-/// Templates (Qwen 3.5/3.6 prompt-drop bug); unsloth/GLM-4.6-GGUF #2
-/// (GLM-4.5/4.6 think-tag handling).
+/// Per-family chat-template overrides. Looked up against the catalog
+/// entry's `family` field (the SoT for "what kind of model is this") —
+/// NOT against the on-disk filename, because the same family ships
+/// under multiple filename conventions (lowercase id when downloaded
+/// via tenzro-node's HF downloader, mixed-case canonical Unsloth name
+/// when downloaded directly).
 ///
 /// To add a new override:
-/// 1. Drop the fixed jinja into `src-tauri/templates/<family>.jinja`.
-/// 2. Add `("<prefix>", "<family>.jinja")` to this list.
-/// 3. The preset generator will wire `--chat-template-file <path>`
-///    into that model's INI section on next spawn.
+/// 1. Drop the fixed jinja into `src-tauri/templates/<file>.jinja`.
+/// 2. Add `("<family>", "<file>.jinja")` to this list, where
+///    `<family>` is the catalog `family` string (case-sensitive,
+///    matches the catalog as written).
+/// 3. The preset generator wires `--chat-template-file <path>` into
+///    that model's INI section on next spawn.
+///
+/// Currently vendored:
+/// - **qwen3.5 / qwen3.6** — froggeric v20 ("The Architect Patch",
+///   2026-06-05) fixes the prompt-drop bug (`content | replace(
+///   '<|think_on|>', '')` — minja's C++ replace filter silently drops
+///   the user prompt when matched at index 0). Symptom: model loads,
+///   accepts the request, generates tokens, every token renders to
+///   empty string, finish_reason ends `length`. The runaway-guard in
+///   streaming.rs ends the chat cleanly with "no readable output" but
+///   the user sees nothing. v20 also fixes an empty-think poisoning
+///   bug (~80% premature stall) and re-architects tool-call / kv-
+///   cache handling. ONE template covers every Qwen 3.5/3.6 size +
+///   both thinking and non-thinking modes (kwargs-driven).
+///   Source: https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
+///   Underlying minja bug: ggml-org/llama.cpp#13178
+///
+/// Note: Qwen 3 (original, pre-3.5) is a separate bug (the
+/// `messages[::-1]` slice that minja couldn't parse) already fixed
+/// upstream in llama.cpp PR #13573 — no vendored template needed.
 const TEMPLATE_OVERRIDES: &[(&str, &str)] = &[
-    // Qwen 3.5 + 3.6 prompt-drop bug: the embedded jinja uses
-    // `content | replace('<|think_on|>', '')` — minja's C++ replace
-    // silently DROPS the entire payload when matched at index 0 of a
-    // user prompt. Symptom: model loads, accepts request, generates
-    // tokens, every token renders to empty string, finish_reason
-    // ends `length` after hitting max_tokens. The runaway-guard in
-    // streaming.rs ends the chat cleanly with "no readable output"
-    // but the user sees nothing.
-    //
-    // Fix: froggeric v20 ("The Architect Patch", 2026-06-05) replaces
-    // the broken replace() with split|join, plus an empty-think
-    // poisoning fix (~80% premature stall) and tool-call/cache
-    // re-architecture. ONE template covers every Qwen 3.5/3.6 size +
-    // both thinking and non-thinking modes (kwargs-driven).
-    //
-    // Source: https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
-    // llama.cpp ticket for the underlying minja bug: ggml-org/llama.cpp#13178
-    //
-    // Note: Qwen 3 (original, pre-3.5) is a SEPARATE bug — the
-    // `messages[::-1]` slice that minja couldn't parse — already fixed
-    // upstream in llama.cpp PR #13573 and shipped in our vendored
-    // build. No vendored template needed for Qwen 3.
-    ("Qwen3.5-", "qwen3.5-3.6-froggeric-v20.jinja"),
-    ("Qwen3.6-", "qwen3.5-3.6-froggeric-v20.jinja"),
+    ("qwen3.5", "qwen3.5-3.6-froggeric-v20.jinja"),
+    ("qwen3.6", "qwen3.5-3.6-froggeric-v20.jinja"),
 ];
 
 /// Build a per-model preset INI from the GGUFs in `models_dir`.
@@ -485,22 +497,39 @@ async fn generate_models_preset(
     let ubatch_size = profile.ubatch_size(ctx_size);
     let threads = profile.threads();
 
-    // Index the catalog by GGUF filename stem so each on-disk model can be
-    // matched to its serving profile / MTP / MoE metadata. `hf_filename`
-    // may carry a sharded subdir prefix (e.g. `Q4_K_M/Model-...-00001-of-
-    // 000NN.gguf`); we key on the bare filename stem, which is what the
-    // router sees on disk.
+    // Index the catalog by EVERY plausible on-disk filename stem so the
+    // match works regardless of who downloaded the GGUF:
+    //
+    //   - `hf_filename` stem      — canonical Unsloth filename, e.g.
+    //                               "Qwen3.5-0.8B-Q4_K_M". The catalog
+    //                               author's official naming.
+    //   - catalog `id`            — what tenzro-node's HF downloader uses
+    //                               when it writes `~/.tenzro/models/<id>.gguf`,
+    //                               e.g. "qwen3.5-0.8b". Without this key
+    //                               the override + sampler block silently
+    //                               no-ops because the file on disk doesn't
+    //                               match the hf_filename stem. Observed
+    //                               symptom: model loads with stock embedded
+    //                               jinja + default samplers, multi-turn
+    //                               chats emit empty tokens (the upstream
+    //                               Qwen 3.5/3.6 prompt-drop bug).
+    //
+    // `hf_filename` may carry a sharded subdir prefix (e.g. `Q4_K_M/Model-
+    // ...-00001-of-000NN.gguf`); we key on the bare filename stem, which
+    // is what the router sees on disk.
     use std::collections::HashMap;
     use tenzro_model::catalog::{MtpKind, get_model_catalog};
     let catalog = get_model_catalog();
-    let by_stem: HashMap<String, &tenzro_model::catalog::HfModelEntry> = catalog
-        .iter()
-        .filter_map(|e| {
-            let file = e.hf_filename.rsplit('/').next()?;
-            let stem = file.strip_suffix(".gguf")?;
-            Some((stem.to_string(), e))
-        })
-        .collect();
+    let mut by_stem: HashMap<String, &tenzro_model::catalog::HfModelEntry> =
+        HashMap::new();
+    for e in catalog.iter() {
+        if let Some(file) = e.hf_filename.rsplit('/').next()
+            && let Some(stem) = file.strip_suffix(".gguf")
+        {
+            by_stem.insert(stem.to_string(), e);
+        }
+        by_stem.insert(e.id.clone(), e);
+    }
 
     let mut ini = String::new();
     ini.push_str("# Generated by ipnops-edge on app start.\n");
@@ -637,25 +666,36 @@ async fn generate_models_preset(
             }
         }
 
-        // Per-model template override when the stem matches a known-
-        // broken prefix. The first match wins so longer / more
-        // specific prefixes should appear before shorter ones in
-        // the TEMPLATE_OVERRIDES list.
-        for (prefix, template_file) in TEMPLATE_OVERRIDES {
-            if stem.starts_with(prefix) {
-                let tpl_path = templates_dir.join(template_file);
-                if tpl_path.exists() {
-                    ini.push_str(&format!(
-                        "chat-template-file = {}\n",
-                        tpl_path.display()
-                    ));
-                    info!(
-                        "Applying chat-template override for {}: {}",
-                        stem,
-                        tpl_path.display()
-                    );
+        // Per-family template override. Looked up against the matched
+        // catalog entry's `family` field — the SoT for "what kind of
+        // model is this". Unmatched models (cat is None) fall through
+        // to the GGUF's embedded template, which is correct: we have
+        // no way to know if their jinja is broken.
+        if let Some(c) = cat {
+            for (family, template_file) in TEMPLATE_OVERRIDES {
+                if c.family == *family {
+                    let tpl_path = templates_dir.join(template_file);
+                    if tpl_path.exists() {
+                        ini.push_str(&format!(
+                            "chat-template-file = {}\n",
+                            tpl_path.display()
+                        ));
+                        info!(
+                            "Applying chat-template override for {} (family={}): {}",
+                            stem,
+                            c.family,
+                            tpl_path.display()
+                        );
+                    } else {
+                        warn!(
+                            "Chat-template override missing for {} (family={}): {} (bundle is broken?)",
+                            stem,
+                            c.family,
+                            tpl_path.display()
+                        );
+                    }
+                    break;
                 }
-                break;
             }
         }
         ini.push('\n');

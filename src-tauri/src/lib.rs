@@ -8,12 +8,14 @@
 //! always-on; the 4 cards in the main screen just choose what the
 //! node DOES.
 
+mod crash_safety;
 mod hardware;
 mod node_lifecycle;
 mod rpc_bridge;
 mod sidecar;
 mod streaming;
 mod telemetry;
+mod watchdog;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,6 +73,15 @@ fn init_logging() -> Option<LogGuard> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Crash-safety net FIRST, before anything else can panic. Installs
+    // the panic hook, libc::atexit handler, and alloc-error hook. Three
+    // layers because Tauri 2 + macOS has multiple silent-exit paths
+    // (wry non-unwinding panic, tokio spawn-task panic dropped on the
+    // floor, double-Drop panic) and any one of them leaves the
+    // llama-server sidecar orphaned with ppid=1. See src/crash_safety.rs
+    // for the full failure-mode catalogue + citations.
+    crash_safety::install_safety_net();
+
     // Opt-in crash telemetry. Initialised ONLY when (a) a DSN was
     // baked into the build via IPNOPS_SENTRY_DSN at compile time AND
     // (b) the user has explicitly opted in by creating the sentinel
@@ -183,6 +194,7 @@ pub fn run() {
         // binding + tray-icon wiring lands in the menu bar surface.
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(AppState::new())
+        .manage(watchdog::UiHeartbeat::new())
         .invoke_handler(tauri::generate_handler![
             node_lifecycle::node_status,
             node_lifecycle::request_role_change,
@@ -190,6 +202,7 @@ pub fn run() {
             node_lifecycle::reset_local_chain,
             telemetry::telemetry_state,
             telemetry::set_telemetry_enabled,
+            watchdog::ui_alive,
             rpc_bridge::rpc_call,
             rpc_bridge::sidecar_chat,
             rpc_bridge::sidecar_load_model,
@@ -287,6 +300,17 @@ pub fn run() {
                     handle.exit(0);
                 });
             }
+
+            // UI heartbeat watchdog. Tauri 2.11 does not expose wry's
+            // `with_on_web_content_process_terminate_handler`, so the
+            // only reliable signal that WKWebView died (renderer crash,
+            // jetsam, JS-thread deadlock) is a JS-side ping that stops
+            // arriving. Frontend posts `invoke('ui_alive')` every ~2s
+            // from a requestAnimationFrame loop; we declare the WebView
+            // dead after 15s of silence and trigger graceful shutdown.
+            // See src/watchdog.rs.
+            let hb = app.state::<std::sync::Arc<watchdog::UiHeartbeat>>().inner().clone();
+            watchdog::spawn_watchdog(app.handle(), hb);
 
             Ok(())
         })
