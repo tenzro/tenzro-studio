@@ -137,6 +137,19 @@ pub async fn auto_start_node(state: &AppState) -> Result<(), String> {
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|e| format!("could not create data dir: {}", e))?;
 
+    // Bind the RPC server to a localhost ephemeral port (kernel picks).
+    // The NodeConfig default is "0.0.0.0:8545" which (a) conflicts with
+    // any other Tenzro process on the host — most notably the deployed
+    // validator that also runs on this dev machine, observed locking
+    // the app out — and (b) is wrong for a desktop app, which should
+    // never expose RPC on a public interface. When the bind fails the
+    // node's RPC subsystem leaks a dropped mpsc receiver, causing the
+    // "Validator warm-up: Channel send error" retry storm that
+    // eventually destabilises the runtime and silently exits the app.
+    // Ephemeral port (`:0`) avoids the conflict and keeps the in-process
+    // RPC functional for any internal consumers (CLI, tests).
+    config.rpc_addr = "127.0.0.1:0".to_string();
+
     // Bootstrap peers — auto-connect to the live Tenzro testnet. The
     // first DNS name resolves to validator-0 (the public RPC + boot
     // node); the rest of the fleet is discovered via libp2p Kademlia
