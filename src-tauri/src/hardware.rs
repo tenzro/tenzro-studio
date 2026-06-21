@@ -182,6 +182,39 @@ impl HardwareProfile {
             GpuClass::AppleSilicon | GpuClass::IntelOrIntegrated | GpuClass::None
         )
     }
+
+    /// `--n-cpu-moe N` — how many of a Mixture-of-Experts model's layers
+    /// should keep their (large, sparsely-activated) expert tensors in CPU
+    /// RAM instead of GPU VRAM. llama.cpp counts from the top layers down,
+    /// so a non-zero N offloads the last N layers' experts while the dense
+    /// attention path and lower layers stay GPU-resident.
+    ///
+    /// Discrete-GPU machines have dedicated VRAM and keep everything on GPU
+    /// (return 0). Unified-memory / CPU-only hosts share one RAM pool, so
+    /// holding every expert in the GPU working set blows the budget on big
+    /// MoE models — we offload a RAM-tier-scaled number of layers. This is
+    /// the default; a future UI control can override it per session.
+    pub fn n_cpu_moe(&self) -> u32 {
+        match self.gpu_class {
+            // Discrete GPUs have dedicated VRAM: keep all experts on GPU.
+            GpuClass::Cuda | GpuClass::Rocm => 0,
+            // Shared-memory / CPU-only hosts: offload more experts the less
+            // RAM there is. These counts are conservative starting points
+            // (llama.cpp clamps N to the model's layer count, so over-asking
+            // is safe).
+            GpuClass::AppleSilicon | GpuClass::IntelOrIntegrated | GpuClass::None => {
+                if self.ram_gb >= 64 {
+                    0
+                } else if self.ram_gb >= 32 {
+                    16
+                } else if self.ram_gb >= 16 {
+                    32
+                } else {
+                    64
+                }
+            }
+        }
+    }
 }
 
 /// Prefer the OS-native P-core probe (Apple Silicon hybrid arch

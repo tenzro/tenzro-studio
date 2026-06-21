@@ -55,6 +55,14 @@ sysinfo = "0.32"
 # `NodeConfig::role` field uses `tenzro_types::network::NetworkRole`.
 tenzro-types = "0.1"
 
+# Curated model catalog (the single source of truth for per-model serving
+# config — samplers, chat-template handling, MTP/MoE topology). The sidecar
+# preset generator reads `get_model_catalog()` to stamp each on-disk GGUF's
+# llama-server preset section with its model-author-recommended profile, so
+# serving behaviour matches the network's catalog exactly. Same publish
+# story as tenzro-node (local `[patch.crates-io]` until published).
+tenzro-model = "0.1"
+
 # Embedded Tenzro node. Distribution model: the installer ships a
 # compiled-in tenzro-node so the home user never installs or runs the
 # node binary themselves. Pinned to a published version so this
