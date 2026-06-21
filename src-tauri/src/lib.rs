@@ -15,6 +15,7 @@ mod rpc_bridge;
 mod sidecar;
 mod streaming;
 mod telemetry;
+mod wallet;
 mod watchdog;
 
 use std::collections::HashMap;
@@ -203,6 +204,8 @@ pub fn run() {
             telemetry::telemetry_state,
             telemetry::set_telemetry_enabled,
             watchdog::ui_alive,
+            wallet::wallet_status,
+            wallet::wallet_create,
             rpc_bridge::model_details,
             rpc_bridge::offload_model,
             rpc_bridge::rpc_call,

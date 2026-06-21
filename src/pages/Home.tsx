@@ -308,6 +308,8 @@ function StatusBar({ status }: { status: NodeStatus | null }) {
       <span className="text-muted-foreground/70">
         Uptime {Math.floor(status.uptime_secs / 60)}m
       </span>
+      <Sep />
+      <WalletChip />
       {showRetry && !showReset && (
         <>
           <Sep />
@@ -348,6 +350,217 @@ function Sep() {
   return <span className="text-muted-foreground/40">·</span>;
 }
 
+/* --------------------------------------------------------------------- */
+/* Wallet                                                                 */
+/* --------------------------------------------------------------------- */
+
+/** Wallet snapshot returned by the `wallet_status` Tauri command. */
+interface WalletStatus {
+  exists: boolean;
+  address: string;
+  display_address: string;
+  balance_wei: string;
+  balance_display: string;
+  node_ready: boolean;
+}
+
+/** Poll the embedded node for the user's wallet + TNZO balance. Returns
+ *  `null` until the first probe resolves. The hook re-runs every 8s so
+ *  balance updates land in the UI without manual refresh. */
+function useWallet(): { status: WalletStatus | null; refresh: () => void } {
+  const [status, setStatus] = useState<WalletStatus | null>(null);
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      try {
+        const s = await invoke<WalletStatus>("wallet_status");
+        if (!cancelled) setStatus(s);
+      } catch (e) {
+        // Node may not be up yet — keep polling.
+        if (!cancelled && status === null) setStatus({
+          exists: false, address: "", display_address: "",
+          balance_wei: "0", balance_display: "—", node_ready: false,
+        });
+      }
+      timer = setTimeout(poll, 8_000);
+    };
+    poll();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tick]);
+  return { status, refresh: () => setTick((t) => t + 1) };
+}
+
+/** Status-bar wallet chip: shows "No wallet" + Create button when none
+ *  exists, or "{balance} TNZO" + a clickable chip that opens the
+ *  wallet details modal. Auto-faucets 10,000 TNZO on first create
+ *  (testnet onboarding). */
+function WalletChip() {
+  const { status, refresh } = useWallet();
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+
+  async function create() {
+    setCreating(true);
+    setError(null);
+    try {
+      await invoke<WalletStatus>("wallet_create");
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  if (!status) {
+    return <span className="text-muted-foreground/70">Wallet …</span>;
+  }
+  if (!status.node_ready) {
+    return <span className="text-muted-foreground/70">Wallet (node starting)</span>;
+  }
+  if (!status.exists) {
+    return (
+      <>
+        <span className="text-muted-foreground/70">No wallet</span>
+        <button
+          type="button"
+          onClick={create}
+          disabled={creating}
+          className="ml-2 border border-emerald-600/40 bg-emerald-600/10 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-emerald-600 dark:text-emerald-400 hover:bg-emerald-600/20 disabled:opacity-50"
+          title="Create a new MPC wallet. You'll be credited 10,000 TNZO on testnet."
+        >
+          {creating ? "Creating…" : "Create wallet"}
+        </button>
+        {error && (
+          <span className="ml-2 text-destructive">{error}</span>
+        )}
+      </>
+    );
+  }
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className="text-foreground hover:underline"
+        title={`Wallet: ${status.display_address} — click for details`}
+      >
+        <span className="font-mono">{status.balance_display}</span>{" "}
+        <span className="text-muted-foreground/70">TNZO</span>
+      </button>
+      {open && (
+        <WalletDetailsModal
+          status={status}
+          onClose={() => setOpen(false)}
+          onRefresh={refresh}
+        />
+      )}
+    </>
+  );
+}
+
+/** Modal showing full wallet details: address (copyable), balance,
+ *  faucet retry button. */
+function WalletDetailsModal({
+  status,
+  onClose,
+  onRefresh,
+}: {
+  status: WalletStatus;
+  onClose: () => void;
+  onRefresh: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  async function copyAddress() {
+    try {
+      await navigator.clipboard.writeText(status.address);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard may be blocked in some webview configs; fall back to selection.
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md border border-border bg-card p-6 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-base font-semibold">Wallet</h2>
+            <div className="mt-0.5 text-xs text-muted-foreground">
+              MPC threshold wallet · local to this machine
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-xs uppercase tracking-wider text-muted-foreground hover:text-foreground"
+          >
+            Close
+          </button>
+        </div>
+        <div className="mt-6 space-y-4">
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              Balance
+            </div>
+            <div className="mt-1 text-2xl font-semibold">
+              <span className="font-mono">{status.balance_display}</span>{" "}
+              <span className="text-base text-muted-foreground">TNZO</span>
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              Address (hex)
+            </div>
+            <div className="mt-1 flex items-center gap-2">
+              <code className="break-all text-xs font-mono text-foreground">
+                {status.address}
+              </code>
+              <button
+                onClick={copyAddress}
+                className="shrink-0 border border-border bg-secondary px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent"
+              >
+                {copied ? "Copied" : "Copy"}
+              </button>
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              Address (display)
+            </div>
+            <code className="mt-1 block break-all text-xs font-mono text-muted-foreground">
+              {status.display_address}
+            </code>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            Keystore lives at <code className="font-mono">~/.tenzro/inference/wallets/</code>.
+            Encrypted with Argon2id; never leaves your machine.
+          </div>
+          <div className="flex justify-end">
+            <button
+              onClick={onRefresh}
+              className="border border-border bg-secondary px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent"
+            >
+              Refresh
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 interface CardFlowProps {
   cardId: CardId;
   onBack: () => void;
@@ -369,17 +582,22 @@ function CardFlow({ cardId, onBack, status }: CardFlowProps) {
         <p className="mt-1 text-sm text-muted-foreground">{card.tagline}</p>
 
         <div className="mt-10">
-          {cardId === "use-network" && <UseNetworkFlow />}
+          {cardId === "use-network" && (
+            <RequireWallet reason="You need a wallet to pay providers for inference.">
+              <UseNetworkFlow />
+            </RequireWallet>
+          )}
           {cardId === "run-local" && <RunLocalFlow />}
-          {cardId === "serve" && <Placeholder>
-            Pick a model you've downloaded, set pricing, register as a
-            provider, start earning from AI requests routed to your node.
-          </Placeholder>}
-          {cardId === "validate" && <Placeholder>
-            Deposit TNZO, generate validator keys (Ed25519 + ML-DSA-65 +
-            BLS), submit a join request, help secure the network once
-            admitted at the next epoch.
-          </Placeholder>}
+          {cardId === "serve" && (
+            <RequireWallet reason="You need a wallet to receive TNZO payments from inference requests routed to your node.">
+              <ServeFlow />
+            </RequireWallet>
+          )}
+          {cardId === "validate" && (
+            <RequireWallet reason="You need a wallet to deposit TNZO and receive validator rewards.">
+              <ValidatorFlow />
+            </RequireWallet>
+          )}
         </div>
       </main>
       <StatusBar status={status} />
@@ -2088,10 +2306,246 @@ function ChatMessageRow({
   );
 }
 
-function Placeholder({ children }: { children: React.ReactNode }) {
+/** Gate three of the four flows (Use Network, Serve, Validate) behind
+ *  a wallet existing. Local AI is the only no-wallet flow.
+ *  Renders a create-wallet CTA inline when no wallet exists yet. */
+function RequireWallet({
+  children,
+  reason,
+}: {
+  children: React.ReactNode;
+  reason: string;
+}) {
+  const { status, refresh } = useWallet();
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function create() {
+    setCreating(true);
+    setError(null);
+    try {
+      await invoke<WalletStatus>("wallet_create");
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  if (!status) {
+    return (
+      <div className="border border-border bg-card p-6 text-sm text-muted-foreground">
+        Loading wallet…
+      </div>
+    );
+  }
+  if (!status.node_ready) {
+    return (
+      <div className="border border-border bg-card p-6 text-sm text-muted-foreground">
+        Waiting for the embedded node to start before checking your wallet…
+      </div>
+    );
+  }
+  if (!status.exists) {
+    return (
+      <div className="border border-border bg-card p-6">
+        <h3 className="text-sm font-semibold">Wallet required</h3>
+        <p className="mt-1 text-sm text-muted-foreground">{reason}</p>
+        <p className="mt-3 text-xs text-muted-foreground">
+          Your wallet is created locally and the keystore never leaves
+          your machine. On testnet you'll be credited 10,000 TNZO so
+          you have enough to use the network straight away.
+        </p>
+        {error && (
+          <p className="mt-2 text-xs text-destructive">{error}</p>
+        )}
+        <div className="mt-4">
+          <button
+            type="button"
+            onClick={create}
+            disabled={creating}
+            className="border border-emerald-600/40 bg-emerald-600 px-4 py-2 text-xs font-medium uppercase tracking-wider text-white hover:bg-emerald-700 disabled:opacity-50"
+          >
+            {creating ? "Creating wallet…" : "Create wallet"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+  return <>{children}</>;
+}
+
+/** Minimal Serve flow: pick a downloaded model and advertise it to the
+ *  network as a provider. Uses tenzro_serveModel + tenzro_registerProvider
+ *  via the existing rpc_call bridge. */
+function ServeFlow() {
+  const local = useLocalModels();
+  const [picked, setPicked] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  async function serve(modelId: string) {
+    setBusy(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      // 1. tenzro_serveModel — registers the model with the network as
+      //    served-by-this-node.
+      await invoke<any>("rpc_call", {
+        args: { method: "tenzro_serveModel", params: { model_id: modelId } },
+      });
+      // 2. tenzro_registerProvider — registers THIS node as a provider so
+      //    others can route requests here.
+      await invoke<any>("rpc_call", {
+        args: { method: "tenzro_registerProvider", params: { model_id: modelId } },
+      });
+      setSuccess(`Serving ${modelId}. Other nodes can now route requests here.`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+      setPicked(null);
+    }
+  }
+
+  if (!local) {
+    return (
+      <div className="border border-border bg-card p-6 text-sm text-muted-foreground">
+        Loading your downloaded models…
+      </div>
+    );
+  }
+  const downloaded = local.filter((m) => m.downloaded);
+  if (downloaded.length === 0) {
+    return (
+      <div className="border border-border bg-card p-6">
+        <h3 className="text-sm font-semibold">No models downloaded yet</h3>
+        <p className="mt-1 text-sm text-muted-foreground">
+          To serve a model you first need to download one. Go to{" "}
+          <span className="font-medium text-foreground">Run AI locally</span>{" "}
+          and download a model — anything in your local catalog can be
+          served to the network.
+        </p>
+      </div>
+    );
+  }
   return (
-    <div className="border border-border bg-card p-6">
-      <p className="text-sm text-muted-foreground">{children}</p>
+    <div className="space-y-3">
+      {error && <p className="text-sm text-destructive">{error}</p>}
+      {success && <p className="text-sm text-emerald-600 dark:text-emerald-400">{success}</p>}
+      <p className="text-xs uppercase tracking-wider text-muted-foreground">
+        Pick a downloaded model to serve to the network
+      </p>
+      <ul className="space-y-2">
+        {downloaded.map((m) => (
+          <li key={m.id} className="flex items-center justify-between gap-4 border border-border bg-card p-4">
+            <div>
+              <div className="text-sm font-medium">{m.name}</div>
+              <div className="mt-0.5 text-xs text-muted-foreground">
+                {m.family} · {m.parameters} ·{" "}
+                {m.context_length.toLocaleString()} ctx
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setPicked(m.id);
+                serve(m.id);
+              }}
+              disabled={busy && picked === m.id}
+              className="border border-emerald-600/40 bg-emerald-600/10 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-emerald-600 dark:text-emerald-400 hover:bg-emerald-600/20 disabled:opacity-50"
+            >
+              {busy && picked === m.id ? "Serving…" : "Serve to network"}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** Minimal Validator flow: deposit TNZO and submit a validator join
+ *  request via tenzro_stake. */
+function ValidatorFlow() {
+  const { status: wallet, refresh } = useWallet();
+  const [amount, setAmount] = useState("1000");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  async function submit() {
+    setBusy(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const wei = BigInt(Math.floor(parseFloat(amount) * 1e18)).toString();
+      await invoke<any>("rpc_call", {
+        args: { method: "tenzro_stake", params: { amount_wei: wei } },
+      });
+      setSuccess(
+        `Deposit of ${amount} TNZO submitted. You'll be admitted as a validator at the next epoch boundary.`,
+      );
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!wallet?.exists) return null;
+  const balanceTnzo = Number(wallet.balance_display || "0");
+  const requested = parseFloat(amount) || 0;
+  const insufficient = requested > balanceTnzo;
+
+  return (
+    <div className="space-y-4 border border-border bg-card p-6">
+      <div>
+        <h3 className="text-sm font-semibold">Become a validator</h3>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Deposit TNZO and your node will help secure the network. Deposits
+          are refundable when you exit. Requires uptime — keep this app
+          running.
+        </p>
+      </div>
+      <div>
+        <label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          Deposit amount (TNZO)
+        </label>
+        <div className="mt-1 flex items-center gap-2">
+          <input
+            type="number"
+            min="100"
+            step="100"
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+            disabled={busy}
+            className="w-40 border border-border bg-background px-2 py-1 text-sm font-mono focus:outline-none focus:border-foreground"
+          />
+          <span className="text-xs text-muted-foreground">
+            Balance: <span className="font-mono">{wallet.balance_display}</span> TNZO
+          </span>
+        </div>
+        {insufficient && (
+          <p className="mt-1 text-xs text-destructive">
+            Insufficient balance.
+          </p>
+        )}
+      </div>
+      {error && <p className="text-sm text-destructive">{error}</p>}
+      {success && <p className="text-sm text-emerald-600 dark:text-emerald-400">{success}</p>}
+      <div>
+        <button
+          type="button"
+          onClick={submit}
+          disabled={busy || insufficient || requested <= 0}
+          className="border border-emerald-600/40 bg-emerald-600 px-4 py-2 text-xs font-medium uppercase tracking-wider text-white hover:bg-emerald-700 disabled:opacity-50"
+        >
+          {busy ? "Submitting…" : `Deposit ${amount} TNZO`}
+        </button>
+      </div>
     </div>
   );
 }

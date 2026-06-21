@@ -91,6 +91,15 @@ tenzro-model = "0.1"
 # the published app build stays path-free and reproducible.
 tenzro-node = "0.1"
 
+# Wallet integration — in-process direct calls so the user's wallet
+# stays local (keystore on disk, balance read from the embedded node's
+# synced chain state). `tenzro-wallet` is declared with the same path
+# tenzro-node resolves to (via cargo's path-collapse) so there's only
+# one TenzroWalletService type in the build, and trait calls from this
+# crate type-check against the same Arc<...> the node hands back.
+tenzro-wallet = "0.1"
+hex = "0.4"
+
 [features]
 # Bundled trainer ships a managed Python venv inside the app bundle so
 # the user gets Tenzro Train contribution out of the box. Off by default
