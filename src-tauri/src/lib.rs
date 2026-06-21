@@ -203,6 +203,8 @@ pub fn run() {
             telemetry::telemetry_state,
             telemetry::set_telemetry_enabled,
             watchdog::ui_alive,
+            rpc_bridge::model_details,
+            rpc_bridge::offload_model,
             rpc_bridge::rpc_call,
             rpc_bridge::sidecar_chat,
             rpc_bridge::sidecar_load_model,

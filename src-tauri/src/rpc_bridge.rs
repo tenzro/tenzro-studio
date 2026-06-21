@@ -300,3 +300,274 @@ pub async fn sidecar_status(state: State<'_, AppState>) -> Result<Value, String>
         None => Ok(serde_json::json!({ "spawned": false })),
     }
 }
+
+/// Combined model details: catalog metadata + on-disk facts (size, path,
+/// whether the per-model sidecar has it loaded). The UI's details panel
+/// calls this with the model `id`; the response is everything the panel
+/// needs in one round-trip.
+///
+/// Catalog facts come from `tenzro_modelMetadata` (the public RPC); the
+/// `local` block is computed here. Returns `null` for unknown ids so the
+/// UI can show "this model isn't in the network catalog" without
+/// erroring.
+#[tauri::command]
+pub async fn model_details(id: String, state: State<'_, AppState>) -> Result<Value, String> {
+    let Some(entry) = tenzro_model::catalog::get_model_by_id(&id) else {
+        return Ok(Value::Null);
+    };
+
+    // On-disk: the downloader writes <download_filename> under models_dir.
+    // For sharded entries the field is "subdir/first-shard.gguf" — we
+    // need to total the subdir AND check existence on the first shard.
+    let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
+    let models_dir = home.join(".tenzro").join("models");
+    let path_rel = if entry.download_filename.is_empty() {
+        format!("{}.gguf", entry.id)
+    } else {
+        entry.download_filename.clone()
+    };
+    let model_path = models_dir.join(&path_rel);
+    let (downloaded, on_disk_bytes, on_disk_path) = if model_path.exists() {
+        let size = std::fs::metadata(&model_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        (true, size, Some(model_path.display().to_string()))
+    } else if model_path.parent().map(|p| p.exists()).unwrap_or(false)
+        && path_rel.contains('/')
+    {
+        // Sharded layout — sum every .gguf inside the subdir.
+        let dir = model_path.parent().unwrap();
+        let mut total = 0u64;
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if e.path().extension().and_then(|s| s.to_str()) == Some("gguf") {
+                    if let Ok(m) = e.metadata() {
+                        total += m.len();
+                    }
+                }
+            }
+        }
+        let exists = total > 0;
+        (exists, total, exists.then(|| dir.display().to_string()))
+    } else {
+        (false, 0, None)
+    };
+
+    // Mmproj sidecar file (vision-capable entries only).
+    let mmproj_path = entry
+        .mmproj
+        .as_ref()
+        .map(|_| models_dir.join(format!("{}.mmproj.gguf", entry.id)));
+    let mmproj_present = mmproj_path
+        .as_ref()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    let mmproj_bytes = mmproj_path
+        .as_ref()
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // Is this model currently loaded by the per-model llama-server router?
+    // We probe the sidecar's /v1/models endpoint and look for status.value == "loaded".
+    let loaded = sidecar_has_loaded(&state, &entry.id).await;
+
+    let moe = entry.moe.map(|m| {
+        serde_json::json!({
+            "num_experts": m.num_experts,
+            "experts_per_token": m.experts_per_token,
+            "shared_experts": m.shared_experts,
+            "params_per_expert_x10": m.params_per_expert_x10,
+        })
+    });
+
+    let template_fix_kind = match &entry.template_fix {
+        tenzro_model::catalog::TemplateFix::None => "none",
+        tenzro_model::catalog::TemplateFix::Vendored { .. } => "vendored",
+    };
+
+    Ok(serde_json::json!({
+        "id": entry.id,
+        "name": entry.name,
+        "family": entry.family,
+        "description": entry.description,
+        "license": entry.license,
+        "hf_repo": entry.hf_repo,
+        "parameters": entry.parameters,
+        "architecture": format!("{:?}", entry.architecture),
+        "context_length": entry.context_length,
+        "quantization": entry.quantization,
+        "min_ram_gb": entry.min_ram_gb,
+        "promotable": entry.promotable,
+        "catalog_size_bytes": entry.size_bytes,
+        "serving": {
+            "temperature": entry.serving.temperature,
+            "top_p": entry.serving.top_p,
+            "top_k": entry.serving.top_k,
+            "min_p": entry.serving.min_p,
+            "jinja_required": entry.serving.jinja_required,
+        },
+        "reasoning": {
+            "supports_thinking": entry.reasoning.supports_thinking,
+            "default_mode": format!("{:?}", entry.reasoning.default_mode).to_lowercase(),
+            "thinking_safe_min_b": entry.reasoning.thinking_safe_min_b,
+            "thinking_min_budget_tokens": entry.reasoning.thinking_min_budget_tokens,
+        },
+        "template_fix": template_fix_kind,
+        "moe": moe,
+        "mtp_kind": format!("{:?}", entry.mtp_kind).to_lowercase(),
+        "drafter_id": entry.drafter_id,
+        "mmproj_required": entry.mmproj.is_some(),
+        "local": {
+            "downloaded": downloaded,
+            "on_disk_bytes": on_disk_bytes,
+            "on_disk_path": on_disk_path,
+            "download_filename": path_rel,
+            "mmproj_present": mmproj_present,
+            "mmproj_bytes": mmproj_bytes,
+            "loaded_in_sidecar": loaded,
+        },
+    }))
+}
+
+/// Probe the sidecar's `/v1/models` endpoint for this model id and
+/// return true iff status.value == "loaded". Tolerates a missing
+/// sidecar (returns false).
+async fn sidecar_has_loaded(state: &State<'_, AppState>, id: &str) -> bool {
+    let base = {
+        let guard = state.sidecar.read().await;
+        match guard.as_ref() {
+            Some(sc) => sc.base_url(),
+            None => return false,
+        }
+    };
+    let url = format!("{}/v1/models", base);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let Ok(resp) = client.get(&url).send().await else {
+        return false;
+    };
+    let Ok(body) = resp.json::<Value>().await else {
+        return false;
+    };
+    body.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter().any(|m| {
+                m.get("id").and_then(|v| v.as_str()) == Some(id)
+                    && m.get("status")
+                        .and_then(|s| s.get("value"))
+                        .and_then(|v| v.as_str())
+                        == Some("loaded")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Remove a downloaded model from disk to reclaim space. Safety:
+///
+/// - Refuses if the model is currently `"loaded"` in the per-model
+///   sidecar — caller must unload first (UI surfaces this as a friendly
+///   error so the user can stop the chat and retry).
+/// - Removes the GGUF (flat or sharded subdir), the mmproj projector
+///   if present, and any matching `.tmp` / `.partial` from a prior
+///   interrupted download.
+/// - Regenerates the preset INI so the router's next rescan no longer
+///   advertises this model. The router itself only re-scans on
+///   restart; the UI should call `sidecar_refresh_models` after
+///   offloading so the change takes effect without an app restart.
+///
+/// Returns the number of bytes freed (for UI confirmation) on success.
+/// The catalog entry itself is untouched — the user can re-download
+/// any time.
+#[tauri::command]
+pub async fn offload_model(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<u64, String> {
+    let entry = tenzro_model::catalog::get_model_by_id(&id)
+        .ok_or_else(|| format!("unknown model id: {}", id))?;
+
+    if sidecar_has_loaded(&state, &id).await {
+        return Err(
+            "model is currently loaded in the inference engine — stop the chat first, then retry"
+                .to_string(),
+        );
+    }
+
+    let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
+    let models_dir = home.join(".tenzro").join("models");
+
+    let path_rel = if entry.download_filename.is_empty() {
+        format!("{}.gguf", entry.id)
+    } else {
+        entry.download_filename.clone()
+    };
+
+    let mut freed: u64 = 0;
+    let mut removed_paths: Vec<String> = Vec::new();
+
+    // Main GGUF (flat) OR sharded subdir.
+    let main_path = models_dir.join(&path_rel);
+    if path_rel.contains('/') {
+        // Sharded layout — remove the entire subdir.
+        if let Some(subdir) = main_path.parent() {
+            if subdir.exists() && subdir != models_dir {
+                if let Ok(rd) = std::fs::read_dir(subdir) {
+                    for e in rd.flatten() {
+                        if let Ok(m) = e.metadata() {
+                            freed += m.len();
+                        }
+                    }
+                }
+                std::fs::remove_dir_all(subdir)
+                    .map_err(|e| format!("failed to remove {}: {}", subdir.display(), e))?;
+                removed_paths.push(subdir.display().to_string());
+            }
+        }
+    } else if main_path.exists() {
+        if let Ok(m) = std::fs::metadata(&main_path) {
+            freed += m.len();
+        }
+        std::fs::remove_file(&main_path)
+            .map_err(|e| format!("failed to remove {}: {}", main_path.display(), e))?;
+        removed_paths.push(main_path.display().to_string());
+    }
+
+    // Mmproj sidecar file.
+    if entry.mmproj.is_some() {
+        let mmproj_path = models_dir.join(format!("{}.mmproj.gguf", entry.id));
+        if mmproj_path.exists() {
+            if let Ok(m) = std::fs::metadata(&mmproj_path) {
+                freed += m.len();
+            }
+            std::fs::remove_file(&mmproj_path)
+                .map_err(|e| format!("failed to remove {}: {}", mmproj_path.display(), e))?;
+            removed_paths.push(mmproj_path.display().to_string());
+        }
+    }
+
+    // Reap any partial-download leftovers keyed on this id.
+    for suffix in [".tmp", ".partial", ".download", ".gguf.tmp"] {
+        let p = models_dir.join(format!("{}{}", entry.id, suffix));
+        if p.exists() {
+            if let Ok(m) = std::fs::metadata(&p) {
+                freed += m.len();
+            }
+            let _ = std::fs::remove_file(&p);
+            removed_paths.push(p.display().to_string());
+        }
+    }
+
+    tracing::info!(
+        model_id = %id,
+        freed_bytes = freed,
+        removed_paths = ?removed_paths,
+        "Offloaded model from disk"
+    );
+
+    Ok(freed)
+}

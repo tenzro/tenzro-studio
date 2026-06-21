@@ -855,6 +855,10 @@ function RunLocalFlow() {
   // stays usable while the node is still "connecting".
   const local = useLocalModels();
   const [picked, setPicked] = useState<ModelInfo | null>(null);
+  const [detailsId, setDetailsId] = useState<string | null>(null);
+  // Local refresh trigger — bumped after a successful offload so the
+  // list re-fetches and the Downloaded badge disappears.
+  const [refreshTick, setRefreshTick] = useState(0);
 
   if (picked) {
     return <LocalModelPane model={picked} onBack={() => setPicked(null)} />;
@@ -909,36 +913,397 @@ function RunLocalFlow() {
       </p>
       <ul className="space-y-2">
         {list.map((m) => (
-          <li key={m.id}>
-            <button
-              onClick={() => setPicked(m)}
-              className="w-full border border-border bg-card p-4 text-left transition hover:bg-accent"
-            >
-              <div className="flex items-baseline justify-between gap-4">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium">{m.name}</span>
-                    {m.downloaded && <DownloadedBadge />}
-                  </div>
-                  <div className="mt-0.5 text-xs text-muted-foreground">
-                    {m.family} · {m.parameters} ·{" "}
-                    {m.context_length.toLocaleString()} ctx
-                    {m.quantization ? ` · ${m.quantization}` : ""}
-                  </div>
-                </div>
-                <SizeTag bytes={m.size_bytes} minRam={m.min_ram_gb} />
-              </div>
-              {m.description && (
-                <p className="mt-2 text-sm text-muted-foreground">
-                  {m.description}
-                </p>
-              )}
-            </button>
+          <li key={`${m.id}-${refreshTick}`}>
+            <ModelRow
+              model={m}
+              onPick={() => setPicked(m)}
+              onShowDetails={() => setDetailsId(m.id)}
+              onOffloaded={() => setRefreshTick((t) => t + 1)}
+            />
           </li>
         ))}
       </ul>
+      {detailsId && (
+        <ModelDetailsModal
+          id={detailsId}
+          onClose={() => setDetailsId(null)}
+          onOffloaded={() => {
+            setDetailsId(null);
+            setRefreshTick((t) => t + 1);
+          }}
+        />
+      )}
     </div>
   );
+}
+
+/** A single model row in the Run-AI-Locally catalog. The main body
+ *  click opens the chat pane; per-row action buttons (Details, Offload)
+ *  stop propagation so they don't trigger the chat-open.
+ *
+ *  Offload requires the model be on disk AND not currently loaded into
+ *  the per-model sidecar — the backend enforces both and returns a
+ *  friendly error if violated. */
+function ModelRow({
+  model,
+  onPick,
+  onShowDetails,
+  onOffloaded,
+}: {
+  model: ModelInfo;
+  onPick: () => void;
+  onShowDetails: () => void;
+  onOffloaded: () => void;
+}) {
+  const [offloading, setOffloading] = useState(false);
+
+  async function offload(e: React.MouseEvent) {
+    e.stopPropagation();
+    const sizeHint = model.size_bytes
+      ? ` (${(model.size_bytes / 1024 / 1024 / 1024).toFixed(2)} GB)`
+      : "";
+    const ok = window.confirm(
+      `Offload ${model.name}${sizeHint}?\n\n` +
+        "This removes the GGUF file from your disk. You can re-download it any time from the catalog. " +
+        "If the model is currently loaded into the inference engine, stop the chat first.",
+    );
+    if (!ok) return;
+    setOffloading(true);
+    try {
+      const freed = await invoke<number>("offload_model", { id: model.id });
+      const gb = freed / 1024 / 1024 / 1024;
+      window.alert(`Freed ${gb.toFixed(2)} GB.`);
+      // Refresh the sidecar so the router stops advertising this model.
+      try {
+        await invoke("sidecar_refresh_models");
+      } catch (e) {
+        console.warn("sidecar_refresh_models after offload failed:", e);
+      }
+      onOffloaded();
+    } catch (e) {
+      window.alert(`Offload failed: ${String(e)}`);
+    } finally {
+      setOffloading(false);
+    }
+  }
+
+  return (
+    <div
+      onClick={onPick}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") onPick();
+      }}
+      className="w-full cursor-pointer border border-border bg-card p-4 text-left transition hover:bg-accent"
+    >
+      <div className="flex items-baseline justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium">{model.name}</span>
+            {model.downloaded && <DownloadedBadge />}
+          </div>
+          <div className="mt-0.5 text-xs text-muted-foreground">
+            {model.family} · {model.parameters} ·{" "}
+            {model.context_length.toLocaleString()} ctx
+            {model.quantization ? ` · ${model.quantization}` : ""}
+          </div>
+        </div>
+        <SizeTag bytes={model.size_bytes} minRam={model.min_ram_gb} />
+      </div>
+      {model.description && (
+        <p className="mt-2 text-sm text-muted-foreground">
+          {model.description}
+        </p>
+      )}
+      <div className="mt-3 flex items-center justify-end gap-2">
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onShowDetails();
+          }}
+          className="border border-border bg-secondary px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent"
+          title="Show full model details (catalog metadata, on-disk size, runtime policy)"
+        >
+          Details
+        </button>
+        {model.downloaded && (
+          <button
+            onClick={offload}
+            disabled={offloading}
+            className="border border-amber-600/40 bg-amber-600/10 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-amber-200 hover:bg-amber-600/20 disabled:opacity-50"
+            title="Remove this model from disk to reclaim space. The catalog entry stays — you can re-download anytime."
+          >
+            {offloading ? "Offloading…" : "Offload"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Full per-model details modal — backed by the `model_details` Tauri
+ *  command which combines catalog metadata + on-disk facts in one
+ *  round-trip. Renders as a centred overlay with a single scrollable
+ *  body. */
+function ModelDetailsModal({
+  id,
+  onClose,
+  onOffloaded,
+}: {
+  id: string;
+  onClose: () => void;
+  onOffloaded: () => void;
+}) {
+  const [data, setData] = useState<any | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [offloading, setOffloading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const d = await invoke<any>("model_details", { id });
+        if (cancelled) return;
+        if (d === null) setError("Model not found in the catalog.");
+        else setData(d);
+      } catch (e) {
+        if (!cancelled) setError(String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  async function offload() {
+    if (!data?.local?.downloaded) return;
+    const gb = (data.local.on_disk_bytes / 1024 / 1024 / 1024).toFixed(2);
+    if (
+      !window.confirm(
+        `Offload ${data.name} (${gb} GB)? You can re-download anytime from the catalog.`,
+      )
+    )
+      return;
+    setOffloading(true);
+    try {
+      const freed = await invoke<number>("offload_model", { id });
+      window.alert(`Freed ${(freed / 1024 / 1024 / 1024).toFixed(2)} GB.`);
+      try {
+        await invoke("sidecar_refresh_models");
+      } catch (e) {
+        console.warn("sidecar_refresh_models after offload failed:", e);
+      }
+      onOffloaded();
+    } catch (e) {
+      window.alert(`Offload failed: ${String(e)}`);
+      setOffloading(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6"
+      onClick={onClose}
+    >
+      <div
+        className="max-h-[85vh] w-full max-w-2xl overflow-y-auto border border-border bg-card p-6 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {error && (
+          <div className="text-sm text-destructive">
+            {error}
+            <button
+              onClick={onClose}
+              className="ml-3 underline hover:no-underline"
+            >
+              Close
+            </button>
+          </div>
+        )}
+        {!data && !error && (
+          <div className="text-sm text-muted-foreground">Loading details…</div>
+        )}
+        {data && (
+          <div className="space-y-4">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-base font-semibold">{data.name}</h2>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  {data.id} · {data.family} · {data.architecture}
+                </div>
+              </div>
+              <button
+                onClick={onClose}
+                className="text-xs uppercase tracking-wider text-muted-foreground hover:text-foreground"
+              >
+                Close
+              </button>
+            </div>
+            {data.description && (
+              <p className="text-sm text-muted-foreground">{data.description}</p>
+            )}
+            <Section title="Model">
+              <KV k="Parameters" v={data.parameters} />
+              <KV k="Quantization" v={data.quantization || "—"} />
+              <KV k="Context length" v={data.context_length.toLocaleString()} />
+              <KV k="Catalog size" v={formatGB(data.catalog_size_bytes)} />
+              <KV k="Min RAM" v={data.min_ram_gb ? `${data.min_ram_gb} GB` : "—"} />
+              <KV k="License" v={data.license || "—"} />
+              <KV k="HF repo" v={data.hf_repo || "—"} mono />
+            </Section>
+            <Section title="On disk">
+              <KV
+                k="Downloaded"
+                v={data.local.downloaded ? "Yes" : "No"}
+                accent={data.local.downloaded ? "good" : "muted"}
+              />
+              {data.local.downloaded && (
+                <>
+                  <KV k="Size on disk" v={formatGB(data.local.on_disk_bytes)} />
+                  <KV k="Path" v={data.local.on_disk_path || "—"} mono />
+                </>
+              )}
+              {data.mmproj_required && (
+                <KV
+                  k="Vision projector"
+                  v={
+                    data.local.mmproj_present
+                      ? `Present (${formatGB(data.local.mmproj_bytes)})`
+                      : "Missing — vision input will degrade to text-only"
+                  }
+                  accent={data.local.mmproj_present ? "good" : "warn"}
+                />
+              )}
+              <KV
+                k="Loaded in engine"
+                v={data.local.loaded_in_sidecar ? "Yes" : "No"}
+                accent={data.local.loaded_in_sidecar ? "good" : "muted"}
+              />
+            </Section>
+            <Section title="Runtime — samplers (model-author defaults)">
+              <KV k="Temperature" v={data.serving.temperature} />
+              <KV k="Top-p" v={data.serving.top_p} />
+              <KV k="Top-k" v={data.serving.top_k || "disabled"} />
+              <KV k="Min-p" v={data.serving.min_p || "disabled"} />
+              <KV
+                k="--jinja"
+                v={data.serving.jinja_required ? "Required" : "Off"}
+              />
+            </Section>
+            <Section title="Runtime — reasoning policy">
+              <KV
+                k="Supports thinking"
+                v={data.reasoning.supports_thinking ? "Yes" : "No"}
+                accent={data.reasoning.supports_thinking ? "good" : "muted"}
+              />
+              {data.reasoning.supports_thinking && (
+                <>
+                  <KV k="Default mode" v={data.reasoning.default_mode} />
+                  <KV
+                    k="Safe min size"
+                    v={`${data.reasoning.thinking_safe_min_b}B active`}
+                  />
+                  <KV
+                    k="Safe min budget"
+                    v={`${data.reasoning.thinking_min_budget_tokens.toLocaleString()} tokens`}
+                  />
+                </>
+              )}
+              <KV
+                k="Chat-template fix"
+                v={data.template_fix === "vendored" ? "Vendored (client-side fix)" : "None (using GGUF embedded)"}
+                accent={data.template_fix === "vendored" ? "good" : "muted"}
+              />
+            </Section>
+            {data.moe && (
+              <Section title="Mixture-of-Experts">
+                <KV k="Total experts" v={data.moe.num_experts} />
+                <KV
+                  k="Experts per token"
+                  v={data.moe.experts_per_token}
+                />
+                <KV k="Shared experts" v={data.moe.shared_experts ?? "—"} />
+              </Section>
+            )}
+            {data.mtp_kind && data.mtp_kind !== "none" && (
+              <Section title="Speculative decoding">
+                <KV k="Type" v={data.mtp_kind} />
+                {data.drafter_id && (
+                  <KV k="Drafter" v={data.drafter_id} mono />
+                )}
+              </Section>
+            )}
+            <div className="flex justify-end pt-2">
+              {data.local.downloaded && (
+                <button
+                  onClick={offload}
+                  disabled={offloading || data.local.loaded_in_sidecar}
+                  className="border border-amber-600/40 bg-amber-600/10 px-3 py-1.5 text-xs font-medium uppercase tracking-wider text-amber-200 hover:bg-amber-600/20 disabled:opacity-50"
+                  title={
+                    data.local.loaded_in_sidecar
+                      ? "Stop the chat first — the model is currently loaded."
+                      : "Free disk space by removing this model. Re-download anytime."
+                  }
+                >
+                  {offloading
+                    ? "Offloading…"
+                    : `Offload (${formatGB(data.local.on_disk_bytes)})`}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+        {title}
+      </h3>
+      <div className="space-y-1">{children}</div>
+    </div>
+  );
+}
+
+function KV({
+  k,
+  v,
+  mono,
+  accent,
+}: {
+  k: string;
+  v: React.ReactNode;
+  mono?: boolean;
+  accent?: "good" | "warn" | "muted";
+}) {
+  const accentClass =
+    accent === "good"
+      ? "text-emerald-600 dark:text-emerald-400"
+      : accent === "warn"
+        ? "text-amber-600 dark:text-amber-400"
+        : "";
+  return (
+    <div className="flex items-start justify-between gap-4 text-xs">
+      <span className="text-muted-foreground">{k}</span>
+      <span
+        className={`text-right ${accentClass} ${mono ? "break-all font-mono" : ""}`}
+      >
+        {v}
+      </span>
+    </div>
+  );
+}
+
+function formatGB(bytes: number | undefined): string {
+  if (!bytes) return "—";
+  const gb = bytes / 1024 / 1024 / 1024;
+  if (gb < 0.01) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${gb.toFixed(2)} GB`;
 }
 
 function DownloadedBadge() {
