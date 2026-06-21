@@ -15,6 +15,9 @@
     "externalBin": [
       "binaries/llama-server"
     ],
+    "resources": [
+      "templates/*.jinja"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

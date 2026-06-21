@@ -431,11 +431,30 @@ fn pick_free_port() -> Result<u16, String> {
 /// 3. The preset generator will wire `--chat-template-file <path>`
 ///    into that model's INI section on next spawn.
 const TEMPLATE_OVERRIDES: &[(&str, &str)] = &[
-    // Vendored overrides not yet checked in — the override map is
-    // ready to receive them. Until templates are vendored, this list
-    // is empty and every GGUF uses its embedded template (current
-    // behaviour). Adding a row here + dropping the jinja file is the
-    // entire enable path.
+    // Qwen 3.5 + 3.6 prompt-drop bug: the embedded jinja uses
+    // `content | replace('<|think_on|>', '')` — minja's C++ replace
+    // silently DROPS the entire payload when matched at index 0 of a
+    // user prompt. Symptom: model loads, accepts request, generates
+    // tokens, every token renders to empty string, finish_reason
+    // ends `length` after hitting max_tokens. The runaway-guard in
+    // streaming.rs ends the chat cleanly with "no readable output"
+    // but the user sees nothing.
+    //
+    // Fix: froggeric v20 ("The Architect Patch", 2026-06-05) replaces
+    // the broken replace() with split|join, plus an empty-think
+    // poisoning fix (~80% premature stall) and tool-call/cache
+    // re-architecture. ONE template covers every Qwen 3.5/3.6 size +
+    // both thinking and non-thinking modes (kwargs-driven).
+    //
+    // Source: https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
+    // llama.cpp ticket for the underlying minja bug: ggml-org/llama.cpp#13178
+    //
+    // Note: Qwen 3 (original, pre-3.5) is a SEPARATE bug — the
+    // `messages[::-1]` slice that minja couldn't parse — already fixed
+    // upstream in llama.cpp PR #13573 and shipped in our vendored
+    // build. No vendored template needed for Qwen 3.
+    ("Qwen3.5-", "qwen3.5-3.6-froggeric-v20.jinja"),
+    ("Qwen3.6-", "qwen3.5-3.6-froggeric-v20.jinja"),
 ];
 
 /// Build a per-model preset INI from the GGUFs in `models_dir`.
@@ -663,15 +682,36 @@ fn resolve_drafter_path(
     path.exists().then_some(path)
 }
 
-/// Path to the vendored chat-template directory. In a bundled app
-/// this lives next to the main executable (where `externalBin`
-/// drops the sidecar binary). In dev mode it's the source tree.
+/// Path to the vendored chat-template directory. Resolution order:
+///
+/// 1. Tauri-bundled resources — on macOS `<bundle>/Contents/Resources/_up_/templates`
+///    (Tauri wraps `resources` paths in `_up_/` because relative `../`-style
+///    paths in resources entries are flattened); Linux `resources/templates`
+///    next to the binary; Windows `resources\templates`.
+/// 2. Sibling-of-exe `templates/` — legacy bundling layout / our previous default.
+/// 3. Source tree `src-tauri/templates/` — `cargo run` / `tauri dev`.
+///
+/// The first existing path wins. If none exist, the TEMPLATE_OVERRIDES
+/// table effectively no-ops (the per-stem check at preset-generation
+/// time falls back to the GGUF's embedded jinja) — which is correct,
+/// defensive behaviour for a misconfigured bundle.
 fn templates_dir() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let bundled = dir.join("templates");
-            if bundled.exists() {
-                return bundled;
+            let candidates = [
+                // macOS Tauri resources path
+                dir.join("../Resources/_up_/templates"),
+                dir.join("../Resources/templates"),
+                // Linux / Windows Tauri resources
+                dir.join("resources/templates"),
+                dir.join("resources/_up_/templates"),
+                // Legacy: sibling-of-exe
+                dir.join("templates"),
+            ];
+            for c in &candidates {
+                if c.exists() {
+                    return c.clone();
+                }
             }
         }
     }
