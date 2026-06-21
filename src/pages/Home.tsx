@@ -866,8 +866,16 @@ function RunLocalFlow() {
 
   // Prefer the full catalog when we have it; otherwise fall back to the
   // locally-present models so the user is never blocked on the network
-  // for something already on their disk.
-  const list = models ?? local;
+  // for something already on their disk. EITHER WAY we enrich every
+  // entry with a `downloaded` flag derived from the on-disk probe —
+  // the network catalog itself has no knowledge of the local user's
+  // disk, so without this enrichment the Offload button never appears
+  // for any model when the network is up.
+  const downloadedIds = new Set((local ?? []).map((m) => m.id));
+  const list = (models ?? local)?.map((m) => ({
+    ...m,
+    downloaded: m.downloaded || downloadedIds.has(m.id),
+  }));
 
   if (!list) {
     return (
