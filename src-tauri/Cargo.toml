@@ -1,0 +1,76 @@
+[package]
+name = "ipnops-edge"
+version = "0.1.0"
+edition = "2024"
+description = "Ipnops Edge — run, serve, and contribute AI to the Tenzro Network"
+license = "LicenseRef-Proprietary"
+publish = false
+repository = "https://github.com/hilarl/ipnops-edge"
+homepage = "https://ipnops.xyz"
+
+# Empty [workspace] isolates this app from any parent workspace so the
+# bundle builds the same way whether the repo is cloned standalone or
+# nested next to the tenzro-network monorepo during development.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri shell
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-sql = { version = "2", features = ["sqlite"] }
+tauri-plugin-updater = "2"
+tauri-plugin-global-shortcut = "2"
+# window-vibrancy intentionally removed: transparent+vibrancy on
+# macOS causes severe WindowServer-compositor contention when a
+# heavy Metal client (llama-server) is also using the GPU. See
+# tauri-apps/tauri#9220 + #8255. Confirmed user-visible whole-screen
+# flicker on M2. Opaque dark theme keeps the chrome aesthetic without
+# the per-frame backdrop sampling tax.
+
+# Async + RPC plumbing for the in-process node lifecycle.
+tokio = { version = "1", features = ["full", "process"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5"
+# Hardware probe (RAM + physical/logical CPU counts) used by the
+# sidecar to pick llama-server flags per host profile. Cross-platform,
+# zero shell-outs — reads /proc on Linux, sysctl on macOS,
+# GlobalMemoryStatusEx on Windows. Same pattern Ollama uses.
+sysinfo = "0.32"
+
+# Type alias used in `node_lifecycle` for role mapping. Pulled directly
+# from the node crate's transitive `tenzro-types` because the public
+# `NodeConfig::role` field uses `tenzro_types::network::NetworkRole`.
+tenzro-types = "0.1"
+
+# Embedded Tenzro node. Distribution model: the installer ships a
+# compiled-in tenzro-node so the home user never installs or runs the
+# node binary themselves. Pinned to a published version so this
+# Cargo.toml resolves cleanly from a fresh clone.
+#
+# Until tenzro-node hits crates.io, contributors hacking on both
+# tenzro-network and tenzro-inference at once can add a
+# `[patch.crates-io] tenzro-node = { path = "../tenzro-network/crates/tenzro-node" }`
+# block at their workspace root — the patch is NOT in this Cargo.toml so
+# the published app build stays path-free and reproducible.
+tenzro-node = "0.1"
+
+[features]
+# Bundled trainer ships a managed Python venv inside the app bundle so
+# the user gets Tenzro Train contribution out of the box. Off by default
+# during dev (the venv is heavy to provision in CI); the release build
+# turns it on via `cargo tauri build --features bundled-trainer`.
+default = []
+bundled-trainer = []

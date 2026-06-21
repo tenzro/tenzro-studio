@@ -1,0 +1,35 @@
+# Node / Vite
+node_modules
+dist
+dist-ssr
+.vite
+
+# Tauri / Rust
+src-tauri/target
+src-tauri/Cargo.lock
+src-tauri/gen
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode
+.idea
+*.swp
+
+# Claude Code local settings / session data
+.claude
+
+# Local secrets / env
+.env
+.env.local
+.env.*.local
+
+# Local cargo patches (per CONTRIBUTING.md, these stay machine-local)
+.cargo/config.toml
+
+# llama-server sidecar binaries — produced by the build script, not
+# checked in (each is ~17 MB and platform-specific). See
+# scripts/build-sidecar.sh.
+src-tauri/binaries/llama-server-*
