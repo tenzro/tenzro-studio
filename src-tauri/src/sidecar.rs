@@ -24,7 +24,8 @@ use std::sync::Arc;
 
 use tauri::AppHandle;
 use tokio::process::{Child, Command};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::hardware::HardwareProfile;
@@ -265,10 +266,22 @@ pub async fn spawn_sidecar(app: &AppHandle) -> Result<Arc<SidecarHandle>, String
 /// buffers) and spawns a fresh one, swapping it into `AppState` under
 /// the write lock. Idempotent enough to call from both the
 /// download-complete hook and the chat-400 backstop.
+/// Serialise concurrent `restart_sidecar` callers. Two restart paths
+/// (download-complete UI hook + chat-400 model-not-found backstop) can
+/// fire within ms of each other; without this lock the second caller
+/// would observe `state.sidecar` as `None` (the first already took it),
+/// skip the stop, spawn a second fresh sidecar, then overwrite the
+/// first's freshly-spawned handle in AppState — leaking a live
+/// llama-server process whose parent is `ipnops-edge` (so `ppid!=1` →
+/// boot-time `reap_orphaned_sidecars` won't catch it either).
+static RESTART_LOCK: OnceCell<Mutex<()>> = OnceCell::const_new();
+
 pub async fn restart_sidecar(
     app: &AppHandle,
     state: &crate::AppState,
 ) -> Result<(), String> {
+    let lock = RESTART_LOCK.get_or_init(|| async { Mutex::new(()) }).await;
+    let _restart_guard = lock.lock().await;
     info!("Restarting llama-server sidecar to re-scan models-dir");
     // Take the old handle out first so a concurrent caller can't also
     // stop it, then stop it (releases Metal/CUDA + frees the port).
@@ -284,6 +297,14 @@ pub async fn restart_sidecar(
     let fresh = spawn_sidecar(app).await?;
     {
         let mut guard = state.sidecar.write().await;
+        if let Some(stray) = guard.take() {
+            // Defensive: if some other path swapped a sidecar in
+            // between our spawn and our write-lock acquire, stop it
+            // before we overwrite — otherwise it leaks as a
+            // non-orphan stray (parent is still ipnops-edge).
+            warn!("Sidecar swapped concurrently during restart — stopping stray before swap");
+            stray.stop().await;
+        }
         *guard = Some(fresh);
     }
     info!("llama-server sidecar restarted — models-dir re-scanned");
