@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 use tauri::Manager;
 use tokio::sync::{Mutex, RwLock};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// Tauri-managed state: the running node handle, the llama-server
 /// sidecar handle, and the in-flight chat-stream cancellation map.
@@ -42,14 +44,59 @@ impl AppState {
     }
 }
 
+/// Logging sink + appender guard. The non-blocking appender's worker
+/// thread shuts down + flushes when [`tracing_appender::non_blocking::WorkerGuard`]
+/// is dropped, so the run() must keep this alive for the whole app
+/// lifetime.
+struct LogGuard {
+    writer: tracing_appender::non_blocking::NonBlocking,
+    _guard: tracing_appender::non_blocking::WorkerGuard,
+}
+
+/// Initialise the file appender under `~/.tenzro/inference/logs/edge.log`
+/// (daily-rotated). Returns `None` if the home directory or logs dir
+/// can't be created — in that case we fall back to stderr-only.
+fn init_logging() -> Option<LogGuard> {
+    let home = dirs::home_dir()?;
+    let log_dir = home.join(".tenzro").join("inference").join("logs");
+    std::fs::create_dir_all(&log_dir).ok()?;
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "edge.log");
+    let (writer, guard) = tracing_appender::non_blocking(file_appender);
+    Some(LogGuard {
+        writer,
+        _guard: guard,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Dual sink: stderr (for `tauri dev` + `Console.app` capture) AND
+    // a daily-rotated file under ~/.tenzro/inference/logs/edge.log so
+    // user crash reports include the full run-up to a failure. The
+    // file is non-blocking (a background writer thread) — the
+    // returned guard MUST stay alive for the lifetime of the app
+    // (dropping it flushes + ends the writer).
+    let log_guard = init_logging();
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+
+    let registry = tracing_subscriber::registry().with(env_filter).with(stderr_layer);
+    if let Some(file_writer) = log_guard.as_ref().map(|g| g.writer.clone()) {
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(file_writer);
+        registry.with(file_layer).init();
+    } else {
+        registry.init();
+    }
+    // Keep the guard alive for the lifetime of the process; dropping
+    // it would close the appender background thread mid-app.
+    if let Some(g) = log_guard {
+        Box::leak(Box::new(g));
+    }
 
     // SQL migrations for the local conversation store. Lives at
     // ~/.tenzro/inference/conversations.db. Versioned + idempotent

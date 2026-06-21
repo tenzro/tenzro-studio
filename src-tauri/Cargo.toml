@@ -43,6 +43,10 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Daily-rotated file log under ~/.tenzro/inference/logs/ so user
+# crash reports include the run-up to the failure (stderr alone is
+# lost when the user closes the terminal or launches from Finder).
+tracing-appender = "0.2"
 dirs = "5"
 # Hardware probe (RAM + physical/logical CPU counts) used by the
 # sidecar to pick llama-server flags per host profile. Cross-platform,
