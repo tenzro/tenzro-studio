@@ -8,8 +8,9 @@
 //! always-on; the 4 cards in the main screen just choose what the
 //! node DOES.
 
+mod cable;
 mod crash_safety;
-mod hardware;
+mod device_commands;
 mod node_lifecycle;
 mod rpc_bridge;
 mod sidecar;
@@ -18,35 +19,16 @@ mod telemetry;
 mod wallet;
 mod watchdog;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use tauri::Manager;
-use tokio::sync::{Mutex, RwLock};
+use tauri::{Emitter, Manager};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-/// Tauri-managed state: the running node handle, the llama-server
-/// sidecar handle, and the in-flight chat-stream cancellation map.
-pub struct AppState {
-    pub node: RwLock<Option<Arc<tenzro_node::NodeHandle>>>,
-    pub sidecar: RwLock<Option<Arc<sidecar::SidecarHandle>>>,
-    /// `request_id` → `CancellationToken` for every chat stream
-    /// currently driving the sidecar. The streaming module uses this
-    /// for both registration (on chat start) and cancellation (on
-    /// user stop).
-    pub inflight: streaming::InflightMap,
-}
-
-impl AppState {
-    fn new() -> Self {
-        Self {
-            node: RwLock::new(None),
-            sidecar: RwLock::new(None),
-            inflight: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-}
+// The shared application state (node handle + sidecar handle + in-flight
+// stream cancellation map) and the ordered teardown both live in
+// `tenzro-studio-core` so the GUI app and the headless CLI run identical
+// lifecycle logic. The Tauri layer just `.manage()`s core's `AppState`
+// and routes its exit hooks through core's `graceful_shutdown`.
+pub use tenzro_studio_core::{AppState, graceful_shutdown};
 
 /// Logging sink + appender guard. The non-blocking appender's worker
 /// thread shuts down + flushes when [`tracing_appender::non_blocking::WorkerGuard`]
@@ -82,6 +64,22 @@ pub fn run() {
     // llama-server sidecar orphaned with ppid=1. See src/crash_safety.rs
     // for the full failure-mode catalogue + citations.
     crash_safety::install_safety_net();
+
+    // Install aws-lc-rs as the process-wide rustls CryptoProvider before the
+    // embedded node builds its libp2p TLS transport. The node authenticates
+    // peer connections with libp2p-tls using the PQ-hybrid X25519MLKEM768 group,
+    // which only aws-lc-rs ships. `tenzro-node::main` does this install, but
+    // Studio spawns the node via `spawn_in_background_with_unlocker` and never
+    // runs that main — so without this every bootstrap-peer handshake fails at
+    // the TLS upgrade ("Failed to upgrade client connection") and the node sits
+    // at 0 peers. `Err` just means another static init already installed the
+    // same provider; that's harmless, so we don't fail startup on it.
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        // Already installed by an earlier static init — fine, continue.
+    }
 
     // Opt-in crash telemetry. Initialised ONLY when (a) a DSN was
     // baked into the build via TENZRO_STUDIO_SENTRY_DSN at compile time AND
@@ -161,6 +159,28 @@ pub fn run() {
             "#,
             kind: tauri_plugin_sql::MigrationKind::Up,
         },
+        tauri_plugin_sql::Migration {
+            version: 2,
+            description: "add projects (folders) for conversations; nullable project_id on conversations",
+            // Projects = Claude-style per-project knowledge container.
+            // A conversation belongs to AT MOST ONE project (NULL =
+            // "unfiled"). Cascading DELETE on the project removes its
+            // conversations too — that's the explicit user expectation
+            // ("delete this project and everything in it").
+            sql: r#"
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    color TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE CASCADE;
+                CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at DESC);
+            "#,
+            kind: tauri_plugin_sql::MigrationKind::Up,
+        },
     ];
 
     let app = tauri::Builder::default()
@@ -194,8 +214,26 @@ pub fn run() {
         // pattern). The plugin is registered here; the per-shortcut
         // binding + tray-icon wiring lands in the menu bar surface.
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // Native OS dialogs (file picker, confirm, message). Replaces
+        // every window.confirm/alert — those are WebView-blocked in
+        // some configs and have inconsistent cross-platform UX.
+        .plugin(tauri_plugin_dialog::init())
+        // Non-secret preference store (theme, default model, chat
+        // retention, telemetry opt-in). Written to a JSON file under
+        // the app's data dir, auto-saved on change.
+        .plugin(tauri_plugin_store::Builder::new().build())
+        // Deep-link scheme `tenzro-studio://` so join-validator
+        // referral links, share-model links, etc. open the app and
+        // route to the right view (handled in setup() below).
+        .plugin(tauri_plugin_deep_link::init())
         .manage(AppState::new())
         .manage(watchdog::UiHeartbeat::new())
+        // FIDO caBLE session manager — drives the cross-device passkey
+        // ceremony (QR + Bluetooth tunnel) so the user's phone-resident
+        // passkey can sign for the desktop without ever transferring
+        // the private key. State is shared so `device_start` and
+        // `device_complete` see the same session map.
+        .manage(std::sync::Arc::new(cable::CableSessionManager::new()))
         .invoke_handler(tauri::generate_handler![
             node_lifecycle::node_status,
             node_lifecycle::request_role_change,
@@ -207,22 +245,113 @@ pub fn run() {
             wallet::wallet_status,
             wallet::wallet_create,
             rpc_bridge::model_details,
+            rpc_bridge::local_models,
             rpc_bridge::offload_model,
+            rpc_bridge::hardware_profile,
             rpc_bridge::rpc_call,
             rpc_bridge::sidecar_chat,
             rpc_bridge::sidecar_load_model,
             rpc_bridge::sidecar_unload_model,
             rpc_bridge::sidecar_list_models,
             rpc_bridge::sidecar_refresh_models,
+            rpc_bridge::set_serving_overrides,
             rpc_bridge::sidecar_status,
             streaming::sidecar_chat_stream,
             streaming::sidecar_chat_cancel,
+            // Device-side passkey primitives — wallet RPCs themselves
+            // are operator-hosted on rpc.tenzro.network; these only own
+            // the parts that MUST live in the Tauri process (secure
+            // enclave access + FIDO caBLE Bluetooth ceremony).
+            device_commands::device_create_passkey,
+            device_commands::device_sign_with_passkey,
+            device_commands::device_attest_key,
+            device_commands::device_delete_passkey,
+            device_commands::device_start_cross_device_link,
+            device_commands::device_complete_cross_device_link,
+            device_commands::device_cancel_cross_device_link,
         ])
         .setup(|app| {
+            // Native menu bar — predefined items get correct platform
+            // accelerators automatically (Cmd-Q, Cmd-M, Cmd-W, Cmd-Z,
+            // Cmd-X, Cmd-C, Cmd-V, etc). Custom items dispatch via the
+            // on_menu_event hook; the frontend listens for menu events
+            // and routes them (e.g. "settings" -> open Settings modal).
+            use tauri::menu::{AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+            let about = AboutMetadataBuilder::new()
+                .name(Some("Tenzro Studio"))
+                .version(Some("0.1.0"))
+                .copyright(Some("Copyright 2026 Tenzro Labs"))
+                .license(Some("Apache 2.0"))
+                .website(Some("https://tenzro.com"))
+                .build();
+            let settings_item = MenuItemBuilder::new("Settings…")
+                .id("settings")
+                .accelerator("CmdOrCtrl+,")
+                .build(app)?;
+            let new_chat_item = MenuItemBuilder::new("New Chat")
+                .id("new_chat")
+                .accelerator("CmdOrCtrl+N")
+                .build(app)?;
+            let palette_item = MenuItemBuilder::new("Command Palette…")
+                .id("palette")
+                .accelerator("CmdOrCtrl+K")
+                .build(app)?;
+            let wallet_item = MenuItemBuilder::new("Wallet")
+                .id("wallet")
+                .accelerator("CmdOrCtrl+Shift+W")
+                .build(app)?;
+            let app_menu = SubmenuBuilder::new(app, "Tenzro Studio")
+                .item(&PredefinedMenuItem::about(app, Some("About Tenzro Studio"), Some(about))?)
+                .separator()
+                .item(&settings_item)
+                .separator()
+                .item(&PredefinedMenuItem::services(app, None)?)
+                .separator()
+                .item(&PredefinedMenuItem::hide(app, None)?)
+                .item(&PredefinedMenuItem::hide_others(app, None)?)
+                .item(&PredefinedMenuItem::show_all(app, None)?)
+                .separator()
+                .item(&PredefinedMenuItem::quit(app, None)?)
+                .build()?;
+            let file_menu = SubmenuBuilder::new(app, "File")
+                .item(&new_chat_item)
+                .separator()
+                .item(&PredefinedMenuItem::close_window(app, None)?)
+                .build()?;
+            let edit_menu = SubmenuBuilder::new(app, "Edit")
+                .item(&PredefinedMenuItem::undo(app, None)?)
+                .item(&PredefinedMenuItem::redo(app, None)?)
+                .separator()
+                .item(&PredefinedMenuItem::cut(app, None)?)
+                .item(&PredefinedMenuItem::copy(app, None)?)
+                .item(&PredefinedMenuItem::paste(app, None)?)
+                .item(&PredefinedMenuItem::select_all(app, None)?)
+                .build()?;
+            let view_menu = SubmenuBuilder::new(app, "View")
+                .item(&palette_item)
+                .item(&wallet_item)
+                .separator()
+                .item(&PredefinedMenuItem::fullscreen(app, None)?)
+                .build()?;
+            let window_menu = SubmenuBuilder::new(app, "Window")
+                .item(&PredefinedMenuItem::minimize(app, None)?)
+                .item(&PredefinedMenuItem::close_window(app, None)?)
+                .build()?;
+            let menu = MenuBuilder::new(app)
+                .items(&[&app_menu, &file_menu, &edit_menu, &view_menu, &window_menu])
+                .build()?;
+            app.set_menu(menu)?;
+            // Custom-id menu events go to the frontend via the
+            // `menu-event` Tauri event so any open page can react.
+            let menu_handle = app.handle().clone();
+            app.on_menu_event(move |_app, ev| {
+                let _ = menu_handle.emit_to(tauri::EventTarget::any(), "menu-event", ev.id().0.clone());
+            });
+
             // Spawn the llama-server sidecar in parallel with the
             // node bootstrap. Sidecar process isolation means a Metal
-            // teardown crash never propagates to the UI — the
-            // headline SOTA stability win.
+            // teardown crash never propagates to the UI — the headline
+            // stability win.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
@@ -348,40 +477,4 @@ pub fn run() {
         }
         _ => {}
     });
-}
-
-/// Ordered teardown. With the sidecar pattern the Metal teardown
-/// danger is entirely inside the sidecar process — killing the
-/// sidecar with SIGKILL is the only reliable way to release Metal /
-/// CUDA buffers on macOS / Linux drivers, and is far safer than the
-/// in-process model unload dance the previous build attempted.
-///
-/// 1. Stop the llama-server sidecar (SIGTERM, then SIGKILL after 3s).
-/// 2. Cancel in-flight downloads on the node side (cleans up .tmp
-///    files).
-/// 3. Drain the embedded node so RocksDB flushes + libp2p disconnects
-///    run cleanly.
-///
-/// Idempotent — safe to call multiple times.
-async fn graceful_shutdown(state: &AppState) {
-    // Sidecar first so its Metal residency sets are reclaimed before
-    // the node shutdown holds the runtime for several seconds.
-    let sidecar = {
-        let mut guard = state.sidecar.write().await;
-        guard.take()
-    };
-    if let Some(sidecar) = sidecar {
-        sidecar.stop().await;
-    }
-
-    node_lifecycle::cancel_all_downloads(state).await;
-    let node = {
-        let mut guard = state.node.write().await;
-        guard.take()
-    };
-    if let Some(handle) = node {
-        if let Err(e) = handle.shutdown_and_wait().await {
-            tracing::warn!("Node shutdown error: {}", e);
-        }
-    }
 }

@@ -30,6 +30,10 @@ npm run tauri dev    # development with hot reload
 npm run tauri build  # produce platform bundles (.dmg / .msi / .AppImage)
 ```
 
+Each installer is built on its own native OS. For per-platform prerequisites,
+the static `llama-server` sidecar build, and step-by-step commands for macOS,
+Linux, and Windows, see **[docs/BUILD.md](docs/BUILD.md)**.
+
 The embedded node currently resolves `tenzro-node` from crates.io. Until
 `tenzro-node 0.1` is published, contributors hacking on both this repo and
 tenzro-network at once can add a

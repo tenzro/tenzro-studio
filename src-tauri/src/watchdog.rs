@@ -22,7 +22,7 @@
 //! <https://github.com/tauri-apps/tauri/issues/13498>.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, State};
@@ -40,12 +40,22 @@ const POLL_INTERVAL_SECS: u64 = 3;
 
 pub struct UiHeartbeat {
     last_seen_ms: AtomicU64,
+    /// Nesting depth of active "pause" requests. While > 0 the watchdog
+    /// treats the UI as alive regardless of ping age. A native Touch ID /
+    /// Secure Enclave prompt blocks the WebView's main thread (and thus the
+    /// `requestAnimationFrame` ping loop) for as long as the user takes to
+    /// authenticate, which can easily exceed the 15s timeout and trip a
+    /// false-positive shutdown mid-prompt. Device-key commands bracket their
+    /// work in a [`HeartbeatPause`] so the watchdog stands down for the
+    /// duration. A counter (not a bool) so concurrent/nested prompts compose.
+    pause_depth: AtomicUsize,
 }
 
 impl UiHeartbeat {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             last_seen_ms: AtomicU64::new(now_ms()),
+            pause_depth: AtomicUsize::new(0),
         })
     }
 
@@ -55,6 +65,35 @@ impl UiHeartbeat {
 
     fn age_ms(&self) -> u64 {
         now_ms().saturating_sub(self.last_seen_ms.load(Ordering::Relaxed))
+    }
+
+    fn is_paused(&self) -> bool {
+        self.pause_depth.load(Ordering::Relaxed) > 0
+    }
+
+    /// Suspend the heartbeat-timeout check until the returned guard drops.
+    /// Use around any operation that legitimately blocks the WebView thread
+    /// (e.g. a native biometric prompt). On drop the heartbeat is bumped so
+    /// the watchdog doesn't immediately fire on stale age accumulated while
+    /// the UI thread was blocked.
+    pub fn pause(self: &Arc<Self>) -> HeartbeatPause {
+        self.pause_depth.fetch_add(1, Ordering::Relaxed);
+        HeartbeatPause { hb: self.clone() }
+    }
+}
+
+/// RAII guard returned by [`UiHeartbeat::pause`]. Decrements the pause depth
+/// and refreshes the heartbeat when dropped.
+pub struct HeartbeatPause {
+    hb: Arc<UiHeartbeat>,
+}
+
+impl Drop for HeartbeatPause {
+    fn drop(&mut self) {
+        // Refresh first so the watchdog's next poll sees a fresh timestamp
+        // rather than the (now stale) one from before the blocking op.
+        self.hb.bump();
+        self.hb.pause_depth.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -83,6 +122,14 @@ pub fn spawn_watchdog(app: &AppHandle, hb: Arc<UiHeartbeat>) {
         tick.tick().await; // skip the immediate first tick
         loop {
             tick.tick().await;
+            // A native biometric prompt blocks the WebView thread, stalling
+            // the UI ping loop. While a device-key op holds a pause guard,
+            // keep the heartbeat fresh and skip the timeout check so we don't
+            // kill the app mid-Touch-ID.
+            if hb.is_paused() {
+                hb.bump();
+                continue;
+            }
             let age = hb.age_ms();
             if age > HEARTBEAT_TIMEOUT_MS {
                 tracing::error!(

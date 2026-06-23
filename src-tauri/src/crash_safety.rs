@@ -23,18 +23,13 @@
 //! is left with `ppid=1` (reparented to launchd), no stderr panic line,
 //! no `~/Library/Logs/DiagnosticReports/Tenzro Studio*.ips`, just a vanished PID.
 //!
-//! This module installs THREE layers of defence:
-//!
-//! - `std::panic::set_hook` — catches unwinding panics, logs payload +
-//!   backtrace via tracing, runs synchronous sidecar kill, then
-//!   `std::process::exit(101)`.
-//! - `libc::atexit` — catches `process::exit`, `process::abort`, and
-//!   non-unwinding aborts from wry. Runs the same sidecar kill.
-//! - `std::alloc::set_alloc_error_hook` — catches allocator OOM.
-//!
-//! All three converge on `kill_sidecar_blocking()` which is idempotent
-//! (guarded by `SHUTDOWN_DONE: AtomicBool`) and synchronous (no `.await`,
-//! because the runtime may be poisoned).
+//! This module installs the panic / atexit hooks that converge on the
+//! signal-safe reaper. The PID registry + the reaper itself
+//! ([`tenzro_studio_core::crash_safety::kill_sidecar_blocking`]) live in
+//! `tenzro-studio-core` because `sidecar.rs` over there registers /
+//! forgets the PID on every spawn / stop; this module only owns the
+//! GUI-process hook installation (it logs via `tracing` and chains the
+//! default Rust panic hook, neither of which belongs in the headless core).
 //!
 //! Sources:
 //! - <https://github.com/tauri-apps/tauri/issues/12338>
@@ -42,88 +37,22 @@
 //! - <https://aptabase.com/blog/catching-panics-on-tauri-apps>
 
 use std::backtrace::Backtrace;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
 
-/// The llama-server sidecar PID, reachable from the panic hook + atexit
-/// handler without needing `AppHandle` (which is unsafe to call into
-/// from a panicking thread) and without needing an `await` (which is
-/// unsafe inside libc::atexit). Stored as a raw u32 because the
-/// kill path uses libc::kill / libc::waitpid directly. 0 = no sidecar.
-///
-/// Populated by `register_sidecar_pid` after the spawn returns; cleared
-/// by `forget_sidecar_pid` on the normal stop path so the atexit hook
-/// doesn't try to kill an already-reaped process.
-static SIDECAR_PID: AtomicU32 = AtomicU32::new(0);
-
-/// Idempotency guard so the kill path runs exactly once even when
-/// multiple exit paths fire concurrently (e.g. panic hook + atexit on
-/// the same process exit).
-static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
+use tenzro_studio_core::crash_safety::kill_sidecar_blocking;
 
 /// One-time slot guarding `install_safety_net` against accidental
 /// double-call (which would chain hook closures forever).
 static INSTALLED: OnceLock<()> = OnceLock::new();
 
-/// Register the llama-server PID so the crash-safety hooks can kill it
-/// on any abnormal exit. Replaces any previously-registered PID
-/// (relevant after `restart_sidecar` swaps the process).
-pub fn register_sidecar_pid(pid: u32) {
-    SIDECAR_PID.store(pid, Ordering::SeqCst);
-}
-
-/// Clear the registered PID. Called from the normal graceful_shutdown
-/// path right before SidecarHandle::stop() runs so the atexit hook
-/// doesn't try to kill an already-reaped process.
-pub fn forget_sidecar_pid() {
-    SIDECAR_PID.store(0, Ordering::SeqCst);
-}
-
-/// SIGTERM → 500ms grace → SIGKILL. Synchronous, signal-safe, no
-/// `await`, no allocation on the kill path. Used from panic hook +
-/// atexit + alloc-error-hook contexts where the tokio runtime may be
-/// poisoned.
-fn kill_sidecar_blocking() {
-    if SHUTDOWN_DONE.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let pid = SIDECAR_PID.swap(0, Ordering::SeqCst);
-    if pid == 0 {
-        return;
-    }
-    #[cfg(unix)]
-    unsafe {
-        // SIGTERM first, then poll waitpid for up to 500ms, then SIGKILL.
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-        let deadline = Instant::now() + Duration::from_millis(500);
-        let mut status: libc::c_int = 0;
-        loop {
-            let r = libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG);
-            if r == pid as libc::pid_t {
-                break;
-            }
-            if Instant::now() >= deadline {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                let _ = libc::waitpid(pid as libc::pid_t, &mut status, 0);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }
-    // eprintln is async-signal-safe enough for this best-effort log;
-    // tracing is NOT signal-safe and may deadlock from the panic hook.
-    eprintln!("crash_safety: sidecar pid {} reaped on abnormal exit", pid);
-}
-
 extern "C" fn atexit_cleanup() {
     kill_sidecar_blocking();
 }
 
-/// Install the panic hook + atexit handler + alloc-error hook. Call
-/// ONCE at the very start of `run()`, before any other initialisation,
-/// so the safety net is armed before any spawn that could panic.
-/// Subsequent calls are no-ops (guarded by `INSTALLED`).
+/// Install the panic hook + atexit handler. Call ONCE at the very start
+/// of `run()`, before any other initialisation, so the safety net is
+/// armed before any spawn that could panic. Subsequent calls are no-ops
+/// (guarded by `INSTALLED`).
 pub fn install_safety_net() {
     if INSTALLED.set(()).is_err() {
         return;

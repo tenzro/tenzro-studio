@@ -11,7 +11,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "msi", "nsis", "deb", "appimage"],
+    "targets": ["app", "dmg", "msi", "nsis", "deb", "rpm", "appimage"],
     "externalBin": [
       "binaries/llama-server"
     ],
@@ -31,10 +31,14 @@
     "macOS": {
       "minimumSystemVersion": "11.0",
       "entitlements": "entitlements.plist",
-      "signingIdentity": null,
-      "hardenedRuntime": true
+      "signingIdentity": "Developer ID Application: Ahmed Hilal Agil (R5FXGKNFBP)",
+      "hardenedRuntime": true,
+      "infoPlist": "Info.plist"
     },
     "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
       "wix": {
         "language": "en-US"
       },
@@ -76,6 +80,11 @@
   "plugins": {
     "shell": {
       "open": true
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["tenzro-studio"]
+      }
     },
     "updater": {
       "active": true,

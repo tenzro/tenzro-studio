@@ -21,10 +21,21 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-window-state = "2"
-tauri-plugin-single-instance = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 tauri-plugin-updater = "2"
 tauri-plugin-global-shortcut = "2"
+# Native OS dialogs (file picker, confirm, message box). Replaces
+# window.confirm / window.alert which the WebView blocks in some Tauri
+# configurations. See docs/serving-policy.md research bundle.
+tauri-plugin-dialog = "2"
+# Non-secret preference store: theme, default model, chat retention,
+# telemetry opt-in flag. Settings.json under the app's data dir.
+tauri-plugin-store = "2"
+# Deep-link scheme `tenzro-studio://` for join-validator referral
+# links, model-share links, etc. The single-instance plugin uses the
+# `deep-link` feature so Windows/Linux behave like macOS.
+tauri-plugin-deep-link = "2"
 # window-vibrancy intentionally removed: transparent+vibrancy on
 # macOS causes severe WindowServer-compositor contention when a
 # heavy Metal client (llama-server) is also using the GPU. See
@@ -32,15 +43,21 @@ tauri-plugin-global-shortcut = "2"
 # flicker on M2. Opaque dark theme keeps the chrome aesthetic without
 # the per-frame backdrop sampling tax.
 
+# GUI-free shared logic: embedded-node lifecycle, llama-server sidecar
+# management, the JSON-RPC bridge, the SSE chat-streaming engine, hardware
+# profiling, and the crash-safety PID registry. The `#[tauri::command]`
+# handlers in this crate are thin wrappers that delegate to these. The same
+# crate backs the headless `tenzro-studio-cli`, so GUI and CLI share one
+# source of truth. Path dep (sibling repo) until published — same publish
+# story as tenzro-node.
+tenzro-studio-core = { path = "../../tenzro-studio-core" }
+
 # Async + RPC plumbing for the in-process node lifecycle.
 tokio = { version = "1", features = ["full", "process"] }
-tokio-util = "0.7"
-futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Daily-rotated file log under ~/.tenzro/inference/logs/ so user
@@ -60,24 +77,15 @@ libc = "0.2"
 sentry = { version = "0.48", default-features = false, features = ["reqwest", "rustls", "backtrace", "contexts", "panic"] }
 sentry-tracing = "0.48"
 dirs = "5"
-# Hardware probe (RAM + physical/logical CPU counts) used by the
-# sidecar to pick llama-server flags per host profile. Cross-platform,
-# zero shell-outs — reads /proc on Linux, sysctl on macOS,
-# GlobalMemoryStatusEx on Windows. Same pattern Ollama uses.
-sysinfo = "0.32"
 
-# Type alias used in `node_lifecycle` for role mapping. Pulled directly
-# from the node crate's transitive `tenzro-types` because the public
-# `NodeConfig::role` field uses `tenzro_types::network::NetworkRole`.
-tenzro-types = "0.1"
-
-# Curated model catalog (the single source of truth for per-model serving
-# config — samplers, chat-template handling, MTP/MoE topology). The sidecar
-# preset generator reads `get_model_catalog()` to stamp each on-disk GGUF's
-# llama-server preset section with its model-author-recommended profile, so
-# serving behaviour matches the network's catalog exactly. Same publish
-# story as tenzro-node (local `[patch.crates-io]` until published).
-tenzro-model = "0.1"
+# rustls CryptoProvider. The embedded node's libp2p transport authenticates
+# TCP with libp2p-tls using the PQ-hybrid X25519MLKEM768 group, which ONLY
+# aws-lc-rs provides. `tenzro-node::main` installs this provider before any
+# TLS subsystem starts — but Studio spawns the node WITHOUT going through that
+# main, so we must install it ourselves in `run()` or every peer handshake
+# fails at the TLS upgrade ("Failed to upgrade client connection"). Version +
+# features MUST match the monorepo workspace so Cargo unifies to one instance.
+rustls = { version = "0.23.39", default-features = false, features = ["std", "aws-lc-rs", "tls12"] }
 
 # Embedded Tenzro node. Distribution model: the installer ships a
 # compiled-in tenzro-node so the user never installs or runs the
@@ -98,7 +106,31 @@ tenzro-node = "0.1"
 # one TenzroWalletService type in the build, and trait calls from this
 # crate type-check against the same Arc<...> the node hands back.
 tenzro-wallet = "0.1"
+
+# Hardware-backed device keys (macOS/iOS Secure Enclave P-256 + ECIES
+# secret-wrapping) and the platform-agnostic keystore-unlock trait. The
+# SE/Touch-ID ceremony AND the biometric `SecureEnclaveUnlocker` that makes
+# the wallet persist across restarts both live here, so Studio no longer
+# carries `security-framework` directly. Same local `[patch.crates-io]`
+# publish story as tenzro-node.
+tenzro-device-key = "0.1"
+tenzro-keystore-unlock = "0.1"
 hex = "0.4"
+
+# Device-side passkey ceremony primitives, lifted from
+# apps/tenzro-desktop. The private key MUST stay in the platform secure
+# enclave (Spec §15.10), so the ceremony runs in the Tauri process
+# rather than the WebView. Wallet RPCs themselves are operator-hosted
+# (rpc.tenzro.network) — Studio is an RPC client for those.
+#
+# `webauthn-authenticator-rs` with the `cable` feature drags `btleplug`
+# for the BLE side of FIDO caBLE (cross-device passkey via QR + BLE
+# tunnel). Per-OS Bluetooth permission strings are required at runtime
+# (Info.plist for macOS, manifest entry for Windows).
+webauthn-authenticator-rs = { version = "0.6.1-dev", features = ["cable"] }
+webauthn-rs-proto = "0.6.1-dev"
+url = "2"
+async-trait = "0.1"
 
 [features]
 # Bundled trainer ships a managed Python venv inside the app bundle so

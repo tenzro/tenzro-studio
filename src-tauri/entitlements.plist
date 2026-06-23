@@ -18,5 +18,35 @@
   <true/>
   <key>com.apple.security.files.downloads.read-write</key>
   <true/>
+  <!--
+    WALLET PERSISTENCE — keychain-access-groups.
+
+    tenzro-device-key needs this entitlement to persist the Secure Enclave
+    wallet key across restarts. Without it, SecKey::new(persistent) returns
+    errSecMissingEntitlement (-34018) and the app falls back to a session-only
+    key (wallet recreated each launch — graceful, by design).
+
+    It is COMMENTED OUT because enabling it on a Developer-ID + hardened-runtime
+    build with NO embedded provisioning profile makes macOS/AMFI SIGKILL the app
+    at launch (<2s, no log output) — tested 2026-06-22. Even the app's OWN
+    App-ID group requires a profile on macOS.
+
+    TO ENABLE (one step once the profile is in place):
+      1. Drop a current macOS `.provisionprofile` for App ID com.tenzro.studio
+         (with the Keychain Sharing capability) at src-tauri/embedded.provisionprofile.
+      2. Uncomment the `provisioningProfile` key in tauri.conf.json (macOS bundle).
+      3. Uncomment the <key>/<array> block below.
+      4. Rebuild + sign. The SE key lands in the default app keychain group
+         R5FXGKNFBP.com.tenzro.studio (device_key uses DataProtectionKeychain,
+         no explicit kSecAttrAccessGroup), so this single group is sufficient.
+
+    The group string is $(AppIdentifierPrefix)<bundle-id> = team prefix + id.
+  -->
+  <!--
+  <key>keychain-access-groups</key>
+  <array>
+    <string>R5FXGKNFBP.com.tenzro.studio</string>
+  </array>
+  -->
 </dict>
 </plist>

@@ -1,8 +1,73 @@
-import { useEffect, useRef, useState } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { Markdown } from "@/components/Markdown";
 import { EmptyState, ModelRowSkeleton } from "@/components/Skeleton";
+import { ConversationSidebar } from "@/components/ConversationSidebar";
+import { WalletDrawer } from "@/components/WalletDrawer";
+import { signPrehashWithPasskey } from "@/lib/passkey";
+
+function safeParseStats(s: string): AssistantStats | undefined {
+  try { return JSON.parse(s) as AssistantStats; } catch { return undefined; }
+}
+
+/* -------------------------------------------------------------------------
+ * Active stream registry — module-scoped so chat switches don't lose
+ * in-flight responses.
+ *
+ * When the user sends a message in conversation A and immediately
+ * switches to conversation B (or starts a new chat), `LocalModelPane`
+ * stays mounted but its local `messages` state is replaced with B's
+ * history. The in-flight stream for A used to write into the now-
+ * displayed `messages` and persist the partial reply into whatever
+ * `conversationId.current` held at the `finally` boundary — which is B,
+ * not A.
+ *
+ * Lifting active streams out of component state fixes that:
+ *  - Each stream owns the conversation id it started with (immutable).
+ *  - Tokens append to a buffer keyed by conversation id, persisted to
+ *    SQL every 2s so a crash mid-stream keeps history.
+ *  - Subscribers (the visible LocalModelPane) re-render via `version`
+ *    bumps; if the visible conversation matches the stream's, we splice
+ *    the live buffer into the rendered messages.
+ *  - On `done`, the final content is appended to SQL once and the
+ *    registry entry is dropped.
+ * ----------------------------------------------------------------------- */
+interface ActiveStream {
+  conversationId: string;
+  modelId: string;
+  content: string;
+  stats: AssistantStats;
+  done: boolean;
+  error: string | null;
+  /** Listeners that should re-render when `content` changes. */
+  subscribers: Set<() => void>;
+}
+
+const ACTIVE_STREAMS = new Map<string, ActiveStream>();
+
+function getActiveStream(conversationId: string): ActiveStream | undefined {
+  return ACTIVE_STREAMS.get(conversationId);
+}
+
+function subscribeStream(conversationId: string, cb: () => void): () => void {
+  const s = ACTIVE_STREAMS.get(conversationId);
+  if (!s) return () => {};
+  s.subscribers.add(cb);
+  return () => { s.subscribers.delete(cb); };
+}
+
+function notifyStream(s: ActiveStream) {
+  for (const cb of s.subscribers) cb();
+}
 
 /** Mirror of `ChatEvent` in src-tauri/src/streaming.rs — one variant
  *  per `kind` discriminator. */
@@ -168,17 +233,20 @@ export default function Home() {
 
   if (picked) {
     return (
-      <CardFlow
-        cardId={picked}
-        onBack={() => setPicked(null)}
-        status={status}
-      />
+      <WalletProvider>
+        <CardFlow
+          cardId={picked}
+          onBack={() => setPicked(null)}
+          status={status}
+        />
+      </WalletProvider>
     );
   }
 
   return (
+    <WalletProvider>
     <div className="flex min-h-screen flex-col">
-      <main className="mx-auto w-full max-w-5xl flex-1 px-8 pt-16">
+      <main className="mx-auto w-full max-w-5xl flex-1 px-8 pt-16 pb-16">
         <header className="mb-12">
           <h1 className="text-3xl font-semibold tracking-tight">
             Tenzro Studio
@@ -212,6 +280,7 @@ export default function Home() {
 
       <StatusBar status={status} />
     </div>
+    </WalletProvider>
   );
 }
 
@@ -220,7 +289,7 @@ function StatusBar({ status }: { status: NodeStatus | null }) {
 
   if (!status) {
     return (
-      <footer className="border-t border-border bg-card px-6 py-3 text-xs text-muted-foreground">
+      <footer className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-card px-6 py-3 text-xs text-muted-foreground">
         Starting embedded node…
       </footer>
     );
@@ -285,7 +354,7 @@ function StatusBar({ status }: { status: NodeStatus | null }) {
   }
 
   return (
-    <footer className="flex items-center gap-6 border-t border-border bg-card px-6 py-3 text-xs text-muted-foreground">
+    <footer className="fixed inset-x-0 bottom-0 z-40 flex items-center gap-6 border-t border-border bg-card px-6 py-3 text-xs text-muted-foreground">
       <div className="flex items-center gap-2">
         <span className={`h-2 w-2 rounded-full ${dotColor}`} />
         <span className="capitalize">{status.connectivity}</span>
@@ -364,10 +433,19 @@ interface WalletStatus {
   node_ready: boolean;
 }
 
-/** Poll the embedded node for the user's wallet + TNZO balance. Returns
- *  `null` until the first probe resolves. The hook re-runs every 8s so
- *  balance updates land in the UI without manual refresh. */
-function useWallet(): { status: WalletStatus | null; refresh: () => void } {
+interface WalletContextValue {
+  status: WalletStatus | null;
+  refresh: () => void;
+}
+
+/** Single source of wallet truth for the whole page. Without this, each
+ *  `useWallet()` call site kept its own `useState`, so creating a wallet in
+ *  one component (e.g. the card flow's `RequireWallet`) never updated the
+ *  status-bar chip or the validator flow. The provider polls once and fans
+ *  the snapshot out; `refresh()` re-probes immediately for every consumer. */
+const WalletContext = createContext<WalletContextValue | null>(null);
+
+function WalletProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<WalletStatus | null>(null);
   const [tick, setTick] = useState(0);
   useEffect(() => {
@@ -390,7 +468,19 @@ function useWallet(): { status: WalletStatus | null; refresh: () => void } {
     return () => { cancelled = true; if (timer) clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick]);
-  return { status, refresh: () => setTick((t) => t + 1) };
+  const value = useMemo<WalletContextValue>(
+    () => ({ status, refresh: () => setTick((t) => t + 1) }),
+    [status],
+  );
+  return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>;
+}
+
+/** Read the shared wallet snapshot + refresh trigger. Must be rendered under
+ *  a [`WalletProvider`]. */
+function useWallet(): WalletContextValue {
+  const ctx = useContext(WalletContext);
+  if (!ctx) throw new Error("useWallet must be used within a WalletProvider");
+  return ctx;
 }
 
 /** Status-bar wallet chip: shows "No wallet" + Create button when none
@@ -403,11 +493,57 @@ function WalletChip() {
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
 
+  // Listen for the native "Wallet" menu item (Cmd-Shift-W) — open
+  // the drawer. Idempotent if already open.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        const u = await listen<string>("menu-event", (ev) => {
+          if (ev.payload === "wallet") setOpen(true);
+        });
+        unlisten = u;
+      } catch { /* ignore */ }
+    })();
+    return () => { unlisten?.(); };
+  }, []);
+
   async function create() {
     setCreating(true);
     setError(null);
     try {
+      // Step 1: device-side passkey ceremony — mints a P-256 keypair
+      // in the platform secure enclave (macOS Secure Enclave / Windows
+      // Hello / Linux libsecret), gated by the platform biometric
+      // prompt. The private key never leaves the enclave; we receive
+      // only the public SEC1 `x ‖ y` bytes.
+      const label = `tenzro-wallet-${Date.now()}`;
+      // Mint a biometry-gated P-256 key in the Secure Enclave. Note:
+      // key *generation* does NOT trigger Touch ID on macOS — only key
+      // *use* (signing) does.
+      const dk = await invoke<{ label: string; public_key_hex: string }>(
+        "device_create_passkey",
+        { label },
+      );
+      // Force the user-presence ceremony: sign a fixed enrollment
+      // challenge with the freshly-minted key. This is what pops Touch
+      // ID and proves the user controls the enclave key before we bind
+      // it to the wallet. Throws if the user cancels the prompt.
+      const challenge =
+        "0000000000000000000000000000000000000000000000000000000000000001";
+      await signPrehashWithPasskey({ label, prehashHex: challenge });
+      // Provision the MPC wallet on the embedded node. The passkey is
+      // now device-bound; future signing flows use
+      // `device_sign_with_passkey`. On-chain enrollment via
+      // `tenzro_enrollPasskey` (ML-DSA-65 hybrid PQ companion key) is
+      // wired in a later iteration.
       await invoke<WalletStatus>("wallet_create");
+      console.info(
+        "Wallet created with device-bound passkey",
+        label,
+        dk.public_key_hex.slice(0, 16) + "…",
+      );
       refresh();
     } catch (e) {
       setError(String(e));
@@ -453,111 +589,13 @@ function WalletChip() {
         <span className="text-muted-foreground/70">TNZO</span>
       </button>
       {open && (
-        <WalletDetailsModal
+        <WalletDrawer
           status={status}
           onClose={() => setOpen(false)}
           onRefresh={refresh}
         />
       )}
     </>
-  );
-}
-
-/** Modal showing full wallet details: address (copyable), balance,
- *  faucet retry button. */
-function WalletDetailsModal({
-  status,
-  onClose,
-  onRefresh,
-}: {
-  status: WalletStatus;
-  onClose: () => void;
-  onRefresh: () => void;
-}) {
-  const [copied, setCopied] = useState(false);
-
-  async function copyAddress() {
-    try {
-      await navigator.clipboard.writeText(status.address);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard may be blocked in some webview configs; fall back to selection.
-    }
-  }
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6"
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-md border border-border bg-card p-6 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <h2 className="text-base font-semibold">Wallet</h2>
-            <div className="mt-0.5 text-xs text-muted-foreground">
-              MPC threshold wallet · local to this machine
-            </div>
-          </div>
-          <button
-            onClick={onClose}
-            className="text-xs uppercase tracking-wider text-muted-foreground hover:text-foreground"
-          >
-            Close
-          </button>
-        </div>
-        <div className="mt-6 space-y-4">
-          <div>
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              Balance
-            </div>
-            <div className="mt-1 text-2xl font-semibold">
-              <span className="font-mono">{status.balance_display}</span>{" "}
-              <span className="text-base text-muted-foreground">TNZO</span>
-            </div>
-          </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              Address (hex)
-            </div>
-            <div className="mt-1 flex items-center gap-2">
-              <code className="break-all text-xs font-mono text-foreground">
-                {status.address}
-              </code>
-              <button
-                onClick={copyAddress}
-                className="shrink-0 border border-border bg-secondary px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent"
-              >
-                {copied ? "Copied" : "Copy"}
-              </button>
-            </div>
-          </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              Address (display)
-            </div>
-            <code className="mt-1 block break-all text-xs font-mono text-muted-foreground">
-              {status.display_address}
-            </code>
-          </div>
-          <div className="text-xs text-muted-foreground">
-            Keystore lives at <code className="font-mono">~/.tenzro/inference/wallets/</code>.
-            Encrypted with Argon2id; never leaves your machine.
-          </div>
-          <div className="flex justify-end">
-            <button
-              onClick={onRefresh}
-              className="border border-border bg-secondary px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent"
-            >
-              Refresh
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -571,7 +609,7 @@ function CardFlow({ cardId, onBack, status }: CardFlowProps) {
   const card = CARDS.find((c) => c.id === cardId)!;
   return (
     <div className="flex min-h-screen flex-col">
-      <main className="mx-auto w-full max-w-5xl flex-1 px-8 pt-12">
+      <main className="mx-auto w-full max-w-5xl flex-1 px-8 pt-12 pb-16">
         <button
           onClick={onBack}
           className="mb-8 text-xs uppercase tracking-wider text-muted-foreground hover:text-foreground"
@@ -627,8 +665,39 @@ function useCatalog() {
     let everLoaded = false;
     let backoff = 2_000;
 
+    // Offline-first fallback: read the bundled catalog + on-disk
+    // contents via the local Tauri command. Shows the user's downloaded
+    // models so they can keep working even with no network.
+    const loadLocal = async (): Promise<ModelInfo[] | null> => {
+      try {
+        const list = await invoke<ModelInfo[]>("local_models");
+        return list;
+      } catch (e) {
+        console.warn("local_models failed:", e);
+        return null;
+      }
+    };
+
     const attempt = async () => {
       if (cancelled) return;
+      // If the browser tells us we're offline, skip the network RPC
+      // entirely and show the local fallback. We still schedule a slow
+      // retry so we pick up connectivity when it returns.
+      if (typeof navigator !== "undefined" && navigator.onLine === false) {
+        const local = await loadLocal();
+        if (cancelled) return;
+        if (local !== null) {
+          setModels(local);
+          setWaiting(false);
+          everLoaded = true;
+        } else if (!everLoaded) {
+          setWaiting(true);
+        }
+        // Long retry — network only comes back when 'online' fires;
+        // this is the safety net if the event is missed.
+        timer = setTimeout(attempt, 60_000);
+        return;
+      }
       try {
         const list = await rpc<ModelInfo[]>("tenzro_listModels");
         if (cancelled) return;
@@ -636,24 +705,42 @@ function useCatalog() {
         setWaiting(false);
         everLoaded = true;
         backoff = 2_000;
-        // Settle into a slow refresh so newly-advertised models show up.
         timer = setTimeout(attempt, 10_000);
       } catch {
         if (cancelled) return;
-        // Keep retrying forever — the node may still be connecting.
-        // Surface a non-fatal "waiting" state only before the first
-        // successful load so an established catalog doesn't flicker to
-        // a waiting banner on a transient refresh failure.
-        if (!everLoaded) setWaiting(true);
-        backoff = Math.min(backoff * 1.5, 15_000);
+        // Network RPC failed. Fall back to the local catalog so the
+        // user can still use downloaded models, then back off harder
+        // before retrying the network call.
+        const local = await loadLocal();
+        if (cancelled) return;
+        if (local !== null && local.length > 0) {
+          setModels(local);
+          setWaiting(false);
+          everLoaded = true;
+        } else if (!everLoaded) {
+          setWaiting(true);
+        }
+        backoff = Math.min(backoff * 2, 60_000);
         timer = setTimeout(attempt, backoff);
       }
     };
 
     attempt();
+
+    // `online` event: try immediately when the browser thinks we're
+    // back. Saves the user from waiting out the backoff window.
+    const onOnline = () => {
+      if (cancelled) return;
+      backoff = 2_000;
+      if (timer) { clearTimeout(timer); timer = null; }
+      attempt();
+    };
+    window.addEventListener("online", onOnline);
+
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      window.removeEventListener("online", onOnline);
     };
   }, []);
 
@@ -987,6 +1074,20 @@ function ChatPane({
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Session-cost tracker. Bumped on every successful response; resets
+  // when the pane unmounts.
+  const [sessionCostTnzo, setSessionCostTnzo] = useState(0);
+  const [firstPaidConfirmed, setFirstPaidConfirmed] = useState(false);
+  // Per-session spending cap loaded from settings (0 = no cap).
+  const [sessionCap, setSessionCap] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    import("../lib/settings").then(async (s) => {
+      const cap = await s.get("sessionSpendCapTnzo");
+      if (!cancelled) setSessionCap(cap ?? 0);
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   const provider = providers[0]; // pick the first one for now; routing logic lives in the node later
 
@@ -1008,8 +1109,43 @@ function ChatPane({
     );
   }
 
+  // Per-token pricing (TNZO/token). Falls back to 0 when missing so the
+  // estimate doesn't error — it just shows "free / not priced".
+  const inWeiPerTok = model.pricing?.input_per_token_wei
+    ? BigInt(model.pricing.input_per_token_wei) : 0n;
+  const outWeiPerTok = model.pricing?.output_per_token_wei
+    ? BigInt(model.pricing.output_per_token_wei) : inWeiPerTok;
+  const inputTokensEstimate = Math.max(1, Math.ceil(input.trim().length / 4));
+  const estCostTnzo = Number(BigInt(inputTokensEstimate) * inWeiPerTok) / 1e18;
+
   async function send() {
     if (!input.trim() || sending) return;
+
+    // Spending cap check: refuse if this request would push us past
+    // the per-session cap. 0 = no cap.
+    if (sessionCap > 0 && sessionCostTnzo + estCostTnzo > sessionCap) {
+      setError(
+        `Per-session spend cap (${sessionCap} TNZO) would be exceeded. Raise it in Settings → Spending, or start a new chat.`,
+      );
+      return;
+    }
+
+    // First-paid confirm: once per session, native OS dialog.
+    if (!firstPaidConfirmed && inWeiPerTok > 0n) {
+      let ok = false;
+      try {
+        const { confirm } = await import("@tauri-apps/plugin-dialog");
+        ok = await confirm(
+          `This chat is paid. ${model.name} costs ~${estCostTnzo.toFixed(6)} TNZO for this prompt and continues to bill per response token. Continue?`,
+          { title: "Paid chat — first confirmation", kind: "info" },
+        );
+      } catch {
+        ok = window.confirm(`Paid chat at ~${estCostTnzo.toFixed(6)} TNZO. Continue?`);
+      }
+      if (!ok) return;
+      setFirstPaidConfirmed(true);
+    }
+
     const userMsg: ChatMsg = { role: "user", content: input };
     const next = [...messages, userMsg];
     setMessages(next);
@@ -1022,8 +1158,6 @@ function ChatPane({
         messages: next.map((m) => ({ role: m.role, content: m.content })),
         stream: false,
       });
-      // POST to the provider's api_url. The /v1/chat/completions
-      // endpoint is the OpenAI-compatible path the node serves.
       const url = (provider.api_url ?? "").replace(/\/$/, "") + "/v1/chat/completions";
       const resp = await fetch(url, {
         method: "POST",
@@ -1037,6 +1171,14 @@ function ChatPane({
         data?.content ??
         JSON.stringify(data);
       setMessages((m) => [...m, { role: "assistant", content }]);
+      // Bill: prompt tokens × input price + completion tokens × output price.
+      const promptToks = data?.usage?.prompt_tokens ?? inputTokensEstimate;
+      const completionToks = data?.usage?.completion_tokens ?? 0;
+      const cost = Number(
+        BigInt(promptToks) * inWeiPerTok +
+        BigInt(completionToks) * outWeiPerTok
+      ) / 1e18;
+      setSessionCostTnzo((c) => c + cost);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1048,6 +1190,30 @@ function ChatPane({
     <div>
       <BackBtn onClick={onBack} />
       <ModelHeader model={model} extra={`via ${provider.provider ?? "remote"}`} />
+      <div className="mt-2 flex items-center justify-between gap-3 border border-border bg-card/40 px-4 py-2 text-xs">
+        <div className="text-muted-foreground">
+          {inWeiPerTok > 0n ? (
+            <>
+              <span className="font-mono">{(Number(inWeiPerTok) / 1e18).toFixed(6)}</span>
+              {" / "}
+              <span className="font-mono">{(Number(outWeiPerTok) / 1e18).toFixed(6)}</span>
+              {" TNZO per input/output token"}
+            </>
+          ) : (
+            <span>Free (no pricing set)</span>
+          )}
+        </div>
+        <div className="text-muted-foreground">
+          This session:{" "}
+          <span className="font-mono text-foreground">{sessionCostTnzo.toFixed(6)}</span>{" TNZO"}
+        </div>
+      </div>
+      {input.trim() && inWeiPerTok > 0n && (
+        <div className="mt-1 text-right text-xs text-muted-foreground">
+          Next request ~<span className="font-mono">{estCostTnzo.toFixed(6)}</span> TNZO
+          (estimated · {inputTokensEstimate} prompt tokens)
+        </div>
+      )}
       <ChatBox
         messages={messages}
         input={input}
@@ -1076,6 +1242,13 @@ function RunLocalFlow() {
   // Local refresh trigger — bumped after a successful offload so the
   // list re-fetches and the Downloaded badge disappears.
   const [refreshTick, setRefreshTick] = useState(0);
+  // Host RAM for the model-row fit indicator (LM-Studio pattern).
+  const hostRamGb = useHostRam();
+  // Catalog filter / sort state.
+  const [query, setQuery] = useState("");
+  const [onlyDownloaded, setOnlyDownloaded] = useState(false);
+  const [onlyFits, setOnlyFits] = useState(false);
+  const [sortBy, setSortBy] = useState<"name" | "size" | "params">("name");
 
   if (picked) {
     return <LocalModelPane model={picked} onBack={() => setPicked(null)} />;
@@ -1125,6 +1298,28 @@ function RunLocalFlow() {
 
   const downloadedCount = list.filter((m) => m.downloaded).length;
 
+  // Apply filter + sort.
+  const q = query.trim().toLowerCase();
+  const filtered = list
+    .filter((m) => {
+      if (q) {
+        const hay = `${m.name} ${m.family} ${m.parameters ?? ""} ${m.quantization ?? ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      if (onlyDownloaded && !m.downloaded) return false;
+      if (onlyFits && hostRamGb && m.min_ram_gb && m.min_ram_gb > hostRamGb) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      if (sortBy === "size") return (a.size_bytes ?? 0) - (b.size_bytes ?? 0);
+      if (sortBy === "params") {
+        const pa = parseFloat((a.parameters ?? "0").replace(/[^0-9.]/g, "")) || 0;
+        const pb = parseFloat((b.parameters ?? "0").replace(/[^0-9.]/g, "")) || 0;
+        return pa - pb;
+      }
+      return a.name.localeCompare(b.name);
+    });
+
   return (
     <div>
       {waiting && !models && (
@@ -1132,21 +1327,59 @@ function RunLocalFlow() {
           <WaitingForNetwork compact />
         </div>
       )}
+      {downloadedCount === 0 && hostRamGb && (
+        <HardwareRecommendation hostRamGb={hostRamGb} models={list} onPick={setPicked} />
+      )}
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <input
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search by name / family / quant…"
+          className="min-w-[12rem] flex-1 border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:border-foreground"
+        />
+        <FilterChip
+          active={onlyDownloaded}
+          onClick={() => setOnlyDownloaded((v) => !v)}
+          label="Downloaded"
+        />
+        <FilterChip
+          active={onlyFits}
+          onClick={() => setOnlyFits((v) => !v)}
+          label="Fits my RAM"
+          disabled={!hostRamGb}
+        />
+        <select
+          value={sortBy}
+          onChange={(e) => setSortBy(e.target.value as any)}
+          className="border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:border-foreground"
+        >
+          <option value="name">Sort: name</option>
+          <option value="size">Sort: size</option>
+          <option value="params">Sort: parameters</option>
+        </select>
+      </div>
       <p className="mb-4 text-xs uppercase tracking-wider text-muted-foreground">
-        {list.length} model{list.length === 1 ? "" : "s"}
+        {filtered.length} of {list.length} model{list.length === 1 ? "" : "s"}
         {downloadedCount > 0 ? ` · ${downloadedCount} downloaded` : ""}
       </p>
       <ul className="space-y-2">
-        {list.map((m) => (
+        {filtered.map((m) => (
           <li key={`${m.id}-${refreshTick}`}>
             <ModelRow
               model={m}
+              hostRamGb={hostRamGb}
               onPick={() => setPicked(m)}
               onShowDetails={() => setDetailsId(m.id)}
               onOffloaded={() => setRefreshTick((t) => t + 1)}
             />
           </li>
         ))}
+        {filtered.length === 0 && (
+          <li className="border border-border bg-card p-6 text-sm text-muted-foreground">
+            No models match your filter.
+          </li>
+        )}
       </ul>
       {detailsId && (
         <ModelDetailsModal
@@ -1174,20 +1407,39 @@ function RunLocalFlow() {
  *  friendly error if violated. */
 function ModelRow({
   model,
+  hostRamGb,
   onPick,
   onShowDetails,
   onOffloaded,
 }: {
   model: ModelInfo;
+  hostRamGb?: number;
   onPick: () => void;
   onShowDetails: () => void;
   onOffloaded: () => void;
 }) {
-  const [phase, setPhase] = useState<"idle" | "confirm" | "offloading" | "done">("idle");
+  const [phase, setPhase] = useState<"idle" | "offloading" | "done">("idle");
   const [error, setError] = useState<string | null>(null);
   const [freed, setFreed] = useState<number>(0);
 
-  async function doOffload() {
+  async function offload() {
+    const sizeHint = model.size_bytes
+      ? `${(model.size_bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+      : "this model";
+    // Native OS confirm dialog (tauri-plugin-dialog). One click,
+    // platform-native UX, no WebView blocking. Falls back gracefully
+    // if the plugin import fails (dev hot-reload edge case).
+    let ok = false;
+    try {
+      const { confirm } = await import("@tauri-apps/plugin-dialog");
+      ok = await confirm(
+        `Free ${sizeHint}? You can re-download this model anytime from the catalog.`,
+        { title: `Offload ${model.name}`, kind: "warning" },
+      );
+    } catch {
+      ok = window.confirm(`Offload ${model.name} (${sizeHint})?`);
+    }
+    if (!ok) return;
     setPhase("offloading");
     setError(null);
     try {
@@ -1199,10 +1451,7 @@ function ModelRow({
       } catch (e) {
         console.warn("sidecar_refresh_models after offload failed:", e);
       }
-      // Brief done-state so the user sees confirmation; then bubble up.
-      setTimeout(() => {
-        onOffloaded();
-      }, 800);
+      setTimeout(() => onOffloaded(), 800);
     } catch (e) {
       setError(String(e));
       setPhase("idle");
@@ -1211,7 +1460,6 @@ function ModelRow({
 
   // Capture-phase handlers on action buttons so React fires them
   // BEFORE the body's bubbling onClick reaches the row container.
-  // Plus stopPropagation as a belt-and-braces guard.
   const stopAll = (e: React.MouseEvent | React.PointerEvent) => {
     e.stopPropagation();
     e.preventDefault();
@@ -1236,7 +1484,7 @@ function ModelRow({
               {model.quantization ? ` · ${model.quantization}` : ""}
             </div>
           </div>
-          <SizeTag bytes={model.size_bytes} minRam={model.min_ram_gb} />
+          <SizeTag bytes={model.size_bytes} minRam={model.min_ram_gb} hostRamGb={hostRamGb} />
         </div>
         {model.description && (
           <p className="mt-2 text-sm text-muted-foreground">
@@ -1284,46 +1532,13 @@ function ModelRow({
             onPointerDown={stopAll}
             onClick={(e) => {
               stopAll(e);
-              setPhase("confirm");
+              offload();
             }}
             className="border border-amber-600/40 bg-amber-600/10 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-amber-700 dark:text-amber-300 hover:bg-amber-600/20"
             title="Remove this model from disk to reclaim space."
           >
             Offload
           </button>
-        )}
-        {phase === "confirm" && (
-          <>
-            <span className="mr-auto text-xs text-muted-foreground">
-              Free{" "}
-              {model.size_bytes
-                ? `${(model.size_bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
-                : "this model"}
-              ?
-            </span>
-            <button
-              type="button"
-              onPointerDown={stopAll}
-              onClick={(e) => {
-                stopAll(e);
-                setPhase("idle");
-              }}
-              className="border border-border bg-secondary px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onPointerDown={stopAll}
-              onClick={(e) => {
-                stopAll(e);
-                doOffload();
-              }}
-              className="border border-amber-600/40 bg-amber-600 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-white hover:bg-amber-700"
-            >
-              Confirm offload
-            </button>
-          </>
         )}
         {phase === "offloading" && (
           <span className="text-xs text-muted-foreground">Offloading…</span>
@@ -1630,15 +1845,130 @@ function DownloadedBadge() {
   );
 }
 
-function SizeTag({ bytes, minRam }: { bytes?: number; minRam?: number }) {
+function SizeTag({
+  bytes,
+  minRam,
+  hostRamGb,
+}: {
+  bytes?: number;
+  minRam?: number;
+  hostRamGb?: number;
+}) {
   if (!bytes) return null;
   const gb = bytes / 1024 / 1024 / 1024;
+  // Fit verdict: red if min_ram exceeds host RAM; amber if it leaves
+  // <2 GB headroom; green if comfortable. Falls back to no badge when
+  // we don't have either number.
+  let fit: { color: string; label: string } | null = null;
+  if (hostRamGb && minRam) {
+    if (minRam > hostRamGb) {
+      fit = { color: "text-destructive", label: "won't fit" };
+    } else if (hostRamGb - minRam < 2) {
+      fit = { color: "text-amber-600 dark:text-amber-400", label: "tight" };
+    } else {
+      fit = { color: "text-emerald-600 dark:text-emerald-400", label: "fits" };
+    }
+  }
   return (
-    <span className="whitespace-nowrap font-mono text-xs text-muted-foreground">
-      {gb.toFixed(2)} GB
+    <span className="whitespace-nowrap text-xs text-muted-foreground">
+      <span className="font-mono">{gb.toFixed(2)} GB</span>
       {minRam ? ` · ${minRam} GB RAM` : ""}
+      {fit && (
+        <>
+          {" · "}
+          <span className={`font-medium ${fit.color}`}>{fit.label}</span>
+        </>
+      )}
     </span>
   );
+}
+
+function FilterChip({
+  active,
+  onClick,
+  label,
+  disabled,
+}: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`border px-2 py-1 text-xs uppercase tracking-wider transition disabled:opacity-50 ${
+        active
+          ? "border-primary bg-primary text-primary-foreground"
+          : "border-border bg-secondary text-secondary-foreground hover:bg-accent"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+/** Empty-state hardware-aware first-run recommendation. Picks the
+ *  largest model whose min_ram_gb fits the host comfortably (host -
+ *  min_ram >= 2 GB) so first-time users don't pick something that
+ *  thrashes their machine. Only renders when nothing is downloaded. */
+function HardwareRecommendation({
+  hostRamGb,
+  models,
+  onPick,
+}: {
+  hostRamGb: number;
+  models: ModelInfo[];
+  onPick: (m: ModelInfo) => void;
+}) {
+  const fits = models
+    .filter((m) => m.min_ram_gb && m.min_ram_gb + 2 <= hostRamGb)
+    .sort((a, b) => (b.min_ram_gb ?? 0) - (a.min_ram_gb ?? 0));
+  const recommended = fits[0];
+  if (!recommended) return null;
+  return (
+    <div className="mb-4 border border-emerald-600/30 bg-emerald-500/5 p-4">
+      <div className="text-[10px] uppercase tracking-wider text-emerald-700 dark:text-emerald-400">
+        Recommended for your hardware
+      </div>
+      <div className="mt-1 flex items-baseline justify-between gap-4">
+        <div>
+          <div className="text-sm font-medium">{recommended.name}</div>
+          <div className="mt-0.5 text-xs text-muted-foreground">
+            {recommended.family} · {recommended.parameters} ·{" "}
+            {recommended.min_ram_gb} GB RAM ·{" "}
+            {((recommended.size_bytes ?? 0) / 1024 / 1024 / 1024).toFixed(2)} GB to download
+            <br />
+            Your machine has <span className="font-mono text-foreground">{hostRamGb} GB</span> RAM —
+            this leaves comfortable headroom for the OS and other apps.
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => onPick(recommended)}
+          className="border border-emerald-600/40 bg-emerald-600 px-3 py-1.5 text-xs font-medium uppercase tracking-wider text-white hover:bg-emerald-700"
+        >
+          Start
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Probe the host's RAM once on mount via hardware_profile. Returns
+ *  undefined while loading. */
+function useHostRam(): number | undefined {
+  const [ram, setRam] = useState<number | undefined>();
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ ram_gb: number }>("hardware_profile")
+      .then((p) => { if (!cancelled) setRam(p.ram_gb); })
+      .catch(() => { /* ignore */ });
+    return () => { cancelled = true; };
+  }, []);
+  return ram;
 }
 
 type LocalState =
@@ -1673,16 +2003,217 @@ function LocalModelPane({
   // it here and auto-dispatch once `engineReady` flips true, instead of
   // erroring on a not-yet-ready sidecar.
   const [queued, setQueued] = useState<string | null>(null);
+  // Conversation persistence. `conversationId` is created lazily on the
+  // first user message so an opened-but-never-used chat doesn't litter
+  // the sidebar. Save points: user message on dispatch; assistant
+  // message on stream finalise.
+  const conversationId = useRef<string | null>(null);
+  // Incremented after every persisted message so the ConversationSidebar
+  // re-fetches the list.
+  const [historyTick, setHistoryTick] = useState(0);
+  const bumpHistory = () => setHistoryTick((t) => t + 1);
 
-  // On mount: if model is already downloaded, jump straight to ready —
-  // the sidecar runs llama-server in router mode and auto-loads the
-  // GGUF on the first /v1/chat/completions request. No explicit
-  // serve/load step needed.
+  // Bumped on every chat-switch so the stream-subscriber effect re-runs.
+  const [streamTick, setStreamTick] = useState(0);
+  const bumpStream = () => setStreamTick((t) => t + 1);
+
+  // Subscribe to the active stream (if any) for whichever conversation
+  // is currently visible. On each delta the subscriber syncs the
+  // visible `messages` state to the registry's buffer, so a chat the
+  // user revisits keeps painting live tokens.
   useEffect(() => {
-    if (!model.downloaded) return;
-    setState({ kind: "ready" });
+    const id = conversationId.current;
+    if (!id) return;
+    const unsub = subscribeStream(id, () => {
+      const live = getActiveStream(id);
+      if (!live) return;
+      setMessages((prev) => {
+        const next = prev.slice();
+        const last = next[next.length - 1];
+        if (last && last.role === "assistant") {
+          next[next.length - 1] = {
+            ...last,
+            content: live.content,
+            streaming: !live.done,
+            stats: live.stats,
+          };
+        }
+        return next;
+      });
+      if (live.done) setSending(false);
+    });
+    return unsub;
+  }, [streamTick]);
+
+  // Sidebar: load an existing conversation's messages into the pane.
+  // Does NOT cancel an in-flight stream — the model keeps generating
+  // into the original chat in the background. If the *new* chat has
+  // its own stream running, we splice the live content into the
+  // loaded SQL history.
+  async function loadConversation(id: string) {
+    try {
+      const { loadMessages } = await import("../lib/conversations");
+      const rows = await loadMessages(id);
+      const loaded: ChatMsg[] = rows.map((r) => ({
+        role: r.role as ChatMsg["role"],
+        content: r.content,
+        streaming: false,
+        stats: r.stats_json ? safeParseStats(r.stats_json) : undefined,
+      }));
+      const live = getActiveStream(id);
+      if (live && !live.done) {
+        // Replace the last assistant row (if it's the partial-saved
+        // placeholder) with a live-streaming row that the subscriber
+        // effect will keep up-to-date.
+        const last = loaded[loaded.length - 1];
+        if (last && last.role === "assistant") {
+          loaded[loaded.length - 1] = {
+            ...last,
+            content: live.content,
+            streaming: true,
+            stats: live.stats,
+          };
+        } else {
+          loaded.push({ role: "assistant", content: live.content, streaming: true, stats: live.stats });
+        }
+      }
+      setMessages(loaded);
+      conversationId.current = id;
+      setChatError(null);
+      // The new chat is in-flight if there's a live stream for it.
+      setSending(!!(live && !live.done));
+      bumpStream(); // re-run the subscribe effect for the new id
+    } catch (e) {
+      console.warn("loadConversation failed:", e);
+    }
+  }
+
+  // Sidebar: start a brand-new chat. Clears the messages + drops the
+  // conversation id so the next dispatch creates a fresh row. Does NOT
+  // cancel an in-flight stream — that one keeps writing into its own
+  // conversation row in the background.
+  function startNewChat() {
+    setMessages([]);
+    conversationId.current = null;
+    setChatError(null);
+    setSending(false);
+    bumpStream();
+  }
+
+  // Cmd-N (native menu) starts a new chat in the current pane.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        const u = await listen<string>("menu-event", (ev) => {
+          if (ev.payload === "new_chat") startNewChat();
+        });
+        unlisten = u;
+      } catch { /* ignore */ }
+    })();
+    return () => { unlisten?.(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Fork from message N: copy messages[0..=N] into a brand-new
+  // conversation row (so the original is preserved) + load it. The
+  // next user turn extends the fork — original untouched.
+  async function forkAt(index: number) {
+    try {
+      const slice = messages.slice(0, index + 1);
+      const { createConversation, appendMessage, deriveTitle } = await import("../lib/conversations");
+      const firstUserMsg = slice.find((m) => m.role === "user")?.content ?? "";
+      const newId = await createConversation({
+        modelId: model.id,
+        title: `Fork: ${deriveTitle(firstUserMsg)}`,
+      });
+      for (const m of slice) {
+        await appendMessage({
+          conversationId: newId,
+          role: m.role,
+          content: m.content,
+          stats: m.stats,
+        });
+      }
+      conversationId.current = newId;
+      setMessages(slice.map((m) => ({ ...m, streaming: false })));
+      setChatError(null);
+      bumpHistory();
+      toast.success("Forked into a new chat");
+    } catch (e) {
+      console.warn("fork failed:", e);
+      toast.error("Fork failed");
+    }
+  }
+
+  // On mount / on model change: figure out the current state and, if
+  // the model is on-disk, pre-load it into the sidecar's KV cache so
+  // the first chat doesn't pay cold-start latency. On unmount, unload
+  // to free the RAM/VRAM.
+  //
+  // Three on-mount paths:
+  //  1. A download is in flight for this model → resume the polling UI.
+  //  2. The file is fully on disk → trigger an explicit `sidecar_load_model`
+  //     and show "Loading…" until it succeeds, then go to `ready`.
+  //  3. Neither → idle.
+  //
+  // `tenzro_getDownloadProgress` *errors* (code -32000) when no entry
+  // exists for the model — treat that as "not downloading" rather than
+  // surfacing it as an error.
+  useEffect(() => {
+    let cancelled = false;
+    let loadedPath: string | null = null;
+    (async () => {
+      try {
+        const progress = await rpc<DownloadProgress>(
+          "tenzro_getDownloadProgress",
+          [{ model_id: model.id }],
+        );
+        if (cancelled) return;
+        if (progress.status === "in_progress" || progress.status === "queued" || progress.status === "pending") {
+          setState({ kind: "downloading", progress });
+          return;
+        }
+        if (progress.status === "completed") {
+          // fall through to the load step below
+        }
+      } catch { /* no in-flight entry — fall through */ }
+      try {
+        const details = await invoke<{
+          local?: { downloaded?: boolean; on_disk_path?: string | null };
+        }>("model_details", { id: model.id }).catch(() => null);
+        if (cancelled) return;
+        const downloaded = details?.local
+          ? !!details.local.downloaded
+          : model.downloaded;
+        if (!downloaded) return; // idle — user clicks Download
+        // The sidecar router (llama-server) auto-loads the GGUF on the
+        // first chat request via `--models-dir` scanning. There is no
+        // explicit pre-load step — earlier attempts hit a non-existent
+        // `/models/load` endpoint and hung. Going straight to "ready"
+        // is correct: the first chat turn pays the cold-start cost,
+        // and the streaming UI's "Loading model into memory…" engine
+        // hint already surfaces that wait inline.
+        loadedPath = details?.local?.on_disk_path ?? null;
+        setState({ kind: "ready" });
+      } catch (e) {
+        console.warn("model state probe failed:", e);
+        if (!cancelled) setState({ kind: "error", message: String(e) });
+      }
+    })();
+    return () => {
+      cancelled = true;
+      // Unload from the sidecar to free memory when the user leaves
+      // this model's pane. Best-effort — we don't block the unmount on
+      // a network round-trip + don't surface the result.
+      if (loadedPath || model.downloaded) {
+        invoke("sidecar_unload_model", { args: { model_id: model.id } })
+          .catch((e) => console.warn("sidecar_unload_model on exit:", e));
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [model.id]);
 
   // Poll download progress while downloading.
   useEffect(() => {
@@ -1768,38 +2299,112 @@ function LocalModelPane({
    *
    *  1. WKWebView on a ProMotion display ticks rAF at up to 120 Hz;
    *     committing four React renders per native compositor frame is
-   *     pure overhead and was a documented amplifier of the whole-
-   *     screen flicker we hit on M-series GPUs.
-   *  2. 30 fps is the SOTA streaming chat refresh rate (LM Studio,
-   *     Claude.ai web). The eye does not notice token-level latency
-   *     above that threshold; the GPU very much does.
+   *     pure overhead and amplified the whole-screen flicker we hit on
+   *     M-series GPUs.
+   *  2. 30 fps is enough for streaming chat — the eye does not notice
+   *     token-level latency above that threshold; the GPU very much
+   *     does.
    */
   async function runStream(history: ChatMsg[]) {
     setSending(true);
     setChatError(null);
 
-    const buf: string[] = [];
+    // Snapshot the conversation id at stream start. Switching chats
+    // mid-stream changes `conversationId.current`, but THIS stream
+    // belongs to whatever was active when the user pressed Send.
+    const streamConvId = conversationId.current;
+    if (!streamConvId) {
+      // No conversation row yet (shouldn't happen — dispatch creates it
+      // before runStream) — fall back to inline-only mode.
+      console.warn("runStream: no conversation id; persistence disabled");
+    }
+
+    // Register this stream so a chat-switch doesn't orphan it.
+    const stream: ActiveStream | null = streamConvId
+      ? {
+          conversationId: streamConvId,
+          modelId: model.id,
+          content: "",
+          stats: {},
+          done: false,
+          error: null,
+          subscribers: new Set(),
+        }
+      : null;
+    if (stream) ACTIVE_STREAMS.set(streamConvId!, stream);
+
     let pending: ReturnType<typeof setTimeout> | null = null;
     const FLUSH_INTERVAL_MS = 33;
+    let buf = "";
     const flush = () => {
       pending = null;
-      if (buf.length === 0) return;
-      const chunk = buf.join("");
-      buf.length = 0;
-      setMessages((prev) => {
-        const next = prev.slice();
-        const last = next[next.length - 1];
-        if (last && last.role === "assistant") {
-          next[next.length - 1] = { ...last, content: last.content + chunk };
-        }
-        return next;
-      });
+      if (!buf) return;
+      const chunk = buf;
+      buf = "";
+      if (stream) {
+        stream.content += chunk;
+        notifyStream(stream);
+      }
+      // Also update the displayed messages, but ONLY if the user is
+      // still viewing this conversation (or no conversation — e.g. a
+      // first-message stream before the row was registered).
+      if (!streamConvId || conversationId.current === streamConvId) {
+        setMessages((prev) => {
+          const next = prev.slice();
+          const last = next[next.length - 1];
+          if (last && last.role === "assistant") {
+            next[next.length - 1] = { ...last, content: last.content + chunk };
+          }
+          return next;
+        });
+      }
     };
     const scheduleFlush = () => {
       if (pending == null) {
         pending = setTimeout(flush, FLUSH_INTERVAL_MS);
       }
     };
+
+    // Periodic partial-save to SQL so a crash mid-stream doesn't lose
+    // history. We write a placeholder assistant row on first delta, then
+    // update its content every 2s. Final stats land in the `finally`.
+    let partialMsgId: number | null = null;
+    let partialSaveTimer: ReturnType<typeof setInterval> | null = null;
+    const saveModule = streamConvId ? import("../lib/conversations") : null;
+    if (streamConvId && saveModule) {
+      partialSaveTimer = setInterval(async () => {
+        if (!stream || stream.content.length === 0) return;
+        try {
+          const mod = await saveModule;
+          if (partialMsgId == null) {
+            // Append a placeholder; remember its id for subsequent updates.
+            // appendMessage doesn't return the id, so we INSERT directly
+            // by re-calling the lib via a slimmer helper. For now, just
+            // append once and rely on the `finally` to replace it via
+            // updateMessage; but appendMessage doesn't expose the id either.
+            // Compromise: append once, mark the id by reading back the
+            // most-recent assistant message for this convo.
+            await mod.appendMessage({
+              conversationId: streamConvId,
+              role: "assistant",
+              content: stream.content,
+            });
+            const rows = await mod.loadMessages(streamConvId);
+            const last = rows[rows.length - 1];
+            if (last && last.role === "assistant") {
+              partialMsgId = last.id;
+            }
+          } else {
+            await mod.updateMessage({
+              messageId: partialMsgId,
+              content: stream.content,
+            });
+          }
+        } catch (e) {
+          console.warn("partial save failed:", e);
+        }
+      }, 2000);
+    }
 
     const requestId =
       typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -1808,29 +2413,34 @@ function LocalModelPane({
     inflightId.current = requestId;
 
     const onEvent = new Channel<ChatEvent>();
-    let stats: AssistantStats = {};
     onEvent.onmessage = (evt) => {
       switch (evt.kind) {
         case "started":
-          stats = { ...stats, ttft_ms: evt.ttft_ms };
+          if (stream) stream.stats = { ...stream.stats, ttft_ms: evt.ttft_ms };
           break;
         case "delta":
-          buf.push(evt.content);
+          buf += evt.content;
           scheduleFlush();
           break;
         case "usage":
-          stats = {
-            ...stats,
-            prompt_tokens: evt.prompt_tokens,
-            completion_tokens: evt.completion_tokens,
-            tok_per_sec: evt.tok_per_sec,
-          };
+          if (stream) {
+            stream.stats = {
+              ...stream.stats,
+              prompt_tokens: evt.prompt_tokens,
+              completion_tokens: evt.completion_tokens,
+              tok_per_sec: evt.tok_per_sec,
+            };
+          }
           break;
         case "done":
-          stats = { ...stats, finish_reason: evt.finish_reason };
+          if (stream) stream.stats = { ...stream.stats, finish_reason: evt.finish_reason };
           break;
         case "error":
-          setChatError(evt.message);
+          if (stream) stream.error = evt.message;
+          // Only surface to the visible UI if we're still on this chat.
+          if (!streamConvId || conversationId.current === streamConvId) {
+            setChatError(evt.message);
+          }
           break;
       }
     };
@@ -1848,11 +2458,12 @@ function LocalModelPane({
       });
     } catch (e) {
       const msg = String(e);
-      // "cancelled" is a user-initiated stop, not an error worth
-      // surfacing — the chat history keeps whatever streamed in.
       if (!msg.includes("cancelled")) {
         console.error(`[sidecar_chat_stream] ${model.id} failed:`, e);
-        setChatError(msg);
+        if (stream) stream.error = msg;
+        if (!streamConvId || conversationId.current === streamConvId) {
+          setChatError(msg);
+        }
       }
     } finally {
       if (pending != null) {
@@ -1860,26 +2471,93 @@ function LocalModelPane({
         pending = null;
       }
       flush();
-      setMessages((prev) => {
-        const next = prev.slice();
-        const last = next[next.length - 1];
-        if (last && last.role === "assistant") {
-          next[next.length - 1] = { ...last, stats, streaming: false };
+      if (partialSaveTimer != null) {
+        clearInterval(partialSaveTimer);
+        partialSaveTimer = null;
+      }
+
+      const finalContent = stream ? stream.content : "";
+      const finalStats = stream ? stream.stats : {};
+      if (stream) {
+        stream.done = true;
+        notifyStream(stream);
+      }
+
+      // Update the displayed messages if the user is still on this chat.
+      if (!streamConvId || conversationId.current === streamConvId) {
+        setMessages((prev) => {
+          const next = prev.slice();
+          const last = next[next.length - 1];
+          if (last && last.role === "assistant") {
+            next[next.length - 1] = { ...last, stats: finalStats, streaming: false };
+          }
+          return next;
+        });
+      }
+
+      // Persist the assistant message. If we saved a partial row, update
+      // it with the final content + stats; otherwise append once.
+      if (streamConvId && finalContent && saveModule) {
+        try {
+          const mod = await saveModule;
+          if (partialMsgId != null) {
+            await mod.updateMessage({
+              messageId: partialMsgId,
+              content: finalContent,
+              stats: finalStats,
+            });
+          } else {
+            await mod.appendMessage({
+              conversationId: streamConvId,
+              role: "assistant",
+              content: finalContent,
+              stats: finalStats,
+            });
+          }
+          bumpHistory();
+        } catch (e) {
+          console.warn("conversation persistence (assistant msg) failed:", e);
         }
-        return next;
-      });
+      }
+
+      if (stream) ACTIVE_STREAMS.delete(streamConvId!);
       inflightId.current = null;
-      setSending(false);
+      // Only flip the spinner if the visible chat is the one that just
+      // finished — otherwise the user is on a different chat and the
+      // input bar shouldn't suddenly unlock.
+      if (!streamConvId || conversationId.current === streamConvId) {
+        setSending(false);
+      }
     }
   }
 
   /** Append a user message + an assistant placeholder and stream the
    *  reply. The placeholder content reflects whether we're actually
-   *  streaming or still waiting for the engine. */
+   *  streaming or still waiting for the engine. Also creates a
+   *  conversation row on the first send + persists the user message. */
   async function dispatch(text: string, waitingForEngine: boolean) {
     const userMsg: ChatMsg = { role: "user", content: text };
     const baseHistory = [...messages, userMsg];
     setMessages([...baseHistory, { role: "assistant", content: "", streaming: true }]);
+    // Conversation row: create lazily on first user message.
+    try {
+      const { createConversation, appendMessage, deriveTitle } = await import("../lib/conversations");
+      if (!conversationId.current) {
+        const id = await createConversation({
+          modelId: model.id,
+          title: deriveTitle(text),
+        });
+        conversationId.current = id;
+        bumpHistory();
+      }
+      await appendMessage({
+        conversationId: conversationId.current,
+        role: "user",
+        content: text,
+      });
+    } catch (e) {
+      console.warn("conversation persistence (user msg) failed:", e);
+    }
     if (waitingForEngine) {
       // Don't start the stream yet — the queue-flush effect will run it
       // once the sidecar reports ready.
@@ -2009,6 +2687,15 @@ function LocalModelPane({
       )}
 
       {state.kind === "ready" && (
+        <div className="mt-4 flex items-stretch border border-border bg-card">
+          <ConversationSidebar
+            modelId={model.id}
+            activeId={conversationId.current}
+            onSelect={loadConversation}
+            onNew={startNewChat}
+            refreshKey={historyTick}
+          />
+          <div className="min-w-0 flex-1">
         <ChatBox
           messages={messages}
           input={input}
@@ -2018,6 +2705,7 @@ function LocalModelPane({
           onSend={sendChat}
           onCancel={cancelChat}
           onRegenerate={regenerateLast}
+          onForkAt={forkAt}
           placeholder={`Message ${model.name}…`}
           engineHint={
             queued
@@ -2029,6 +2717,8 @@ function LocalModelPane({
                 : undefined
           }
         />
+          </div>
+        </div>
       )}
     </div>
   );
@@ -2105,6 +2795,7 @@ function ChatBox({
   onSend,
   onCancel,
   onRegenerate,
+  onForkAt,
   placeholder,
   engineHint,
 }: {
@@ -2119,6 +2810,9 @@ function ChatBox({
   onCancel?: () => void;
   /** When omitted, the per-message Regenerate affordance is hidden. */
   onRegenerate?: () => void;
+  /** Branch a new chat from message index N. When omitted, Fork is
+   *  hidden. */
+  onForkAt?: (index: number) => void;
   placeholder: string;
   /** Non-fatal status shown while the inference engine is still
    *  spinning up (starting / loading model / queued send). */
@@ -2160,13 +2854,12 @@ function ChatBox({
           <ChatMessageRow
             key={i}
             msg={m}
-            // Only the trailing assistant message gets the
-            // Regenerate affordance.
             onRegenerate={
               i === messages.length - 1 && m.role === "assistant" && !m.streaming
                 ? onRegenerate
                 : undefined
             }
+            onFork={onForkAt ? () => onForkAt(i) : undefined}
           />
         ))}
         {error && <div className="text-sm text-destructive">{error}</div>}
@@ -2228,9 +2921,11 @@ function ChatBox({
 function ChatMessageRow({
   msg,
   onRegenerate,
+  onFork,
 }: {
   msg: ChatMsg;
   onRegenerate?: () => void;
+  onFork?: () => void;
 }) {
   async function copy() {
     try {
@@ -2266,6 +2961,16 @@ function ChatMessageRow({
           >
             Copy
           </button>
+          {onFork && !msg.streaming && (
+            <button
+              onClick={onFork}
+              className="text-[10px] uppercase tracking-wider text-muted-foreground hover:text-foreground"
+              aria-label="Fork from here"
+              title="Branch a new chat from this point"
+            >
+              Fork
+            </button>
+          )}
           {isAssistant && onRegenerate && !msg.streaming && (
             <button
               onClick={onRegenerate}
@@ -2324,7 +3029,37 @@ function RequireWallet({
     setCreating(true);
     setError(null);
     try {
+      // Step 1: device-side passkey ceremony — mints a P-256 keypair
+      // in the platform secure enclave (macOS Secure Enclave / Windows
+      // Hello / Linux libsecret), gated by the platform biometric
+      // prompt. The private key never leaves the enclave; we receive
+      // only the public SEC1 `x ‖ y` bytes.
+      const label = `tenzro-wallet-${Date.now()}`;
+      // Mint a biometry-gated P-256 key in the Secure Enclave. Note:
+      // key *generation* does NOT trigger Touch ID on macOS — only key
+      // *use* (signing) does.
+      const dk = await invoke<{ label: string; public_key_hex: string }>(
+        "device_create_passkey",
+        { label },
+      );
+      // Force the user-presence ceremony: sign a fixed enrollment
+      // challenge with the freshly-minted key. This is what pops Touch
+      // ID and proves the user controls the enclave key before we bind
+      // it to the wallet. Throws if the user cancels the prompt.
+      const challenge =
+        "0000000000000000000000000000000000000000000000000000000000000001";
+      await signPrehashWithPasskey({ label, prehashHex: challenge });
+      // Provision the MPC wallet on the embedded node. The passkey is
+      // now device-bound; future signing flows use
+      // `device_sign_with_passkey`. On-chain enrollment via
+      // `tenzro_enrollPasskey` (ML-DSA-65 hybrid PQ companion key) is
+      // wired in a later iteration.
       await invoke<WalletStatus>("wallet_create");
+      console.info(
+        "Wallet created with device-bound passkey",
+        label,
+        dk.public_key_hex.slice(0, 16) + "…",
+      );
       refresh();
     } catch (e) {
       setError(String(e));
@@ -2385,22 +3120,58 @@ function ServeFlow() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  // Set of model_ids this user has registered as a provider for during
+  // this session. Drives the "Serving" badge.
+  const [serving, setServing] = useState<Set<string>>(new Set());
+  // Network-wide endpoints — used to show "N total live providers for
+  // this model" so the user sees market context before serving.
+  const { endpoints } = useEndpoints();
+  // Live provider stats from tenzro_providerStats. Polled every 5s
+  // while the Serve flow is mounted.
+  const [stats, setStats] = useState<{
+    total_requests?: number;
+    successful?: number;
+    avg_latency?: string;
+    total_earnings_wei?: string;
+    total_rewards_wei?: string;
+    max_concurrent?: number;
+    current_active?: number;
+    utilization?: string;
+  } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const resp = await invoke<any>("rpc_call", {
+          args: { method: "tenzro_providerStats", params: {} },
+        });
+        if (!cancelled) setStats(resp?.result ?? null);
+      } catch { /* node may not be ready */ }
+      if (!cancelled) setTimeout(poll, 5_000);
+    };
+    poll();
+    return () => { cancelled = true; };
+  }, []);
+
+  const earningsTnzo = stats?.total_earnings_wei
+    ? Number(BigInt(stats.total_earnings_wei)) / 1e18
+    : 0;
+  const rewardsTnzo = stats?.total_rewards_wei
+    ? Number(BigInt(stats.total_rewards_wei)) / 1e18
+    : 0;
 
   async function serve(modelId: string) {
     setBusy(true);
     setError(null);
     setSuccess(null);
     try {
-      // 1. tenzro_serveModel — registers the model with the network as
-      //    served-by-this-node.
       await invoke<any>("rpc_call", {
         args: { method: "tenzro_serveModel", params: { model_id: modelId } },
       });
-      // 2. tenzro_registerProvider — registers THIS node as a provider so
-      //    others can route requests here.
       await invoke<any>("rpc_call", {
         args: { method: "tenzro_registerProvider", params: { model_id: modelId } },
       });
+      setServing((s) => new Set(s).add(modelId));
       setSuccess(`Serving ${modelId}. Other nodes can now route requests here.`);
     } catch (e) {
       setError(String(e));
@@ -2431,62 +3202,148 @@ function ServeFlow() {
       </div>
     );
   }
+  // Per-model network-provider counts (so the user sees market context).
+  const providerCount = new Map<string, number>();
+  for (const ep of endpoints ?? []) {
+    providerCount.set(ep.model_id, (providerCount.get(ep.model_id) ?? 0) + 1);
+  }
+
   return (
     <div className="space-y-3">
+      {/* Earnings + activity stats from tenzro_providerStats. */}
+      <div className="grid grid-cols-4 gap-3">
+        <StatBox
+          label="Earnings (lifetime)"
+          value={`${earningsTnzo.toFixed(4)} TNZO`}
+          hint={stats?.utilization === "Active" ? "Active" : "Idle"}
+        />
+        <StatBox
+          label="Rewards (lifetime)"
+          value={`${rewardsTnzo.toFixed(4)} TNZO`}
+          hint="from epoch distributions"
+        />
+        <StatBox
+          label="Requests served"
+          value={String(stats?.total_requests ?? "—")}
+          hint={`avg ${stats?.avg_latency ?? "—"} latency`}
+        />
+        <StatBox
+          label="Serving"
+          value={`${stats?.current_active ?? serving.size} / ${stats?.max_concurrent ?? "?"}`}
+          hint="active models / max concurrent"
+        />
+      </div>
       {error && <p className="text-sm text-destructive">{error}</p>}
       {success && <p className="text-sm text-emerald-600 dark:text-emerald-400">{success}</p>}
       <p className="text-xs uppercase tracking-wider text-muted-foreground">
         Pick a downloaded model to serve to the network
       </p>
       <ul className="space-y-2">
-        {downloaded.map((m) => (
-          <li key={m.id} className="flex items-center justify-between gap-4 border border-border bg-card p-4">
-            <div>
-              <div className="text-sm font-medium">{m.name}</div>
-              <div className="mt-0.5 text-xs text-muted-foreground">
-                {m.family} · {m.parameters} ·{" "}
-                {m.context_length.toLocaleString()} ctx
+        {downloaded.map((m) => {
+          const live = providerCount.get(m.id) ?? 0;
+          const isServing = serving.has(m.id);
+          return (
+            <li key={m.id} className="flex items-center justify-between gap-4 border border-border bg-card p-4">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  {m.name}
+                  {isServing && (
+                    <span className="border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
+                      Serving
+                    </span>
+                  )}
+                </div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  {m.family} · {m.parameters} ·{" "}
+                  {m.context_length.toLocaleString()} ctx
+                  {live > 0 && (
+                    <>
+                      {" · "}
+                      <span className="text-foreground/70">
+                        {live} live provider{live === 1 ? "" : "s"}
+                      </span>
+                    </>
+                  )}
+                </div>
               </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                setPicked(m.id);
-                serve(m.id);
-              }}
-              disabled={busy && picked === m.id}
-              className="border border-emerald-600/40 bg-emerald-600/10 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-emerald-600 dark:text-emerald-400 hover:bg-emerald-600/20 disabled:opacity-50"
-            >
-              {busy && picked === m.id ? "Serving…" : "Serve to network"}
-            </button>
-          </li>
-        ))}
+              <button
+                type="button"
+                onClick={() => {
+                  setPicked(m.id);
+                  serve(m.id);
+                }}
+                disabled={busy && picked === m.id}
+                className="border border-emerald-600/40 bg-emerald-600/10 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-emerald-600 dark:text-emerald-400 hover:bg-emerald-600/20 disabled:opacity-50"
+              >
+                {busy && picked === m.id ? "Serving…" : isServing ? "Re-advertise" : "Serve to network"}
+              </button>
+            </li>
+          );
+        })}
       </ul>
+    </div>
+  );
+}
+
+function StatBox({ label, value, hint }: { label: string; value: string; hint: string }) {
+  return (
+    <div className="border border-border bg-card p-4">
+      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <div className="mt-1 font-mono text-2xl font-semibold">{value}</div>
+      <div className="mt-0.5 text-[10px] text-muted-foreground">{hint}</div>
     </div>
   );
 }
 
 /** Minimal Validator flow: deposit TNZO and submit a validator join
  *  request via tenzro_stake. */
+/** Validator onboarding wizard: pre-flight checks → per-risk acknowledgment
+ *  → deposit. Each risk is a separate checkbox tied to one concrete fact
+ *  (Ethereum Launchpad pattern); we don't dump a wall of legalese. */
 function ValidatorFlow() {
   const { status: wallet, refresh } = useWallet();
+  const [step, setStep] = useState<"preflight" | "risks" | "deposit" | "submitted">("preflight");
   const [amount, setAmount] = useState("1000");
+  const [acks, setAcks] = useState({ deposit: false, uptime: false, slashing: false, exit: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
+  const [txHash, setTxHash] = useState<string | null>(null);
+
+  // Node status — we need it for the preflight check.
+  const [nodeStatus, setNodeStatus] = useState<NodeStatus | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const s = await invoke<NodeStatus | null>("node_status");
+        if (!cancelled) setNodeStatus(s);
+      } catch { /* ignore */ }
+      if (!cancelled) setTimeout(poll, 5_000);
+    };
+    poll();
+    return () => { cancelled = true; };
+  }, []);
+
+  if (!wallet?.exists) return null;
+  const balanceTnzo = Number(wallet.balance_display || "0");
+  const requested = parseFloat(amount) || 0;
+  const insufficient = requested > balanceTnzo;
+  const acksOk = Object.values(acks).every(Boolean);
 
   async function submit() {
     setBusy(true);
     setError(null);
-    setSuccess(null);
     try {
       const wei = BigInt(Math.floor(parseFloat(amount) * 1e18)).toString();
-      await invoke<any>("rpc_call", {
+      const resp = await invoke<any>("rpc_call", {
         args: { method: "tenzro_stake", params: { amount_wei: wei } },
       });
-      setSuccess(
-        `Deposit of ${amount} TNZO submitted. You'll be admitted as a validator at the next epoch boundary.`,
-      );
+      const err = resp?.error;
+      if (err) throw new Error(err.message ?? "deposit failed");
+      setTxHash(resp?.result?.tx_hash ?? resp?.result ?? "pending");
+      setStep("submitted");
       refresh();
     } catch (e) {
       setError(String(e));
@@ -2495,58 +3352,303 @@ function ValidatorFlow() {
     }
   }
 
-  if (!wallet?.exists) return null;
-  const balanceTnzo = Number(wallet.balance_display || "0");
-  const requested = parseFloat(amount) || 0;
-  const insufficient = requested > balanceTnzo;
-
   return (
-    <div className="space-y-4 border border-border bg-card p-6">
-      <div>
+    <div className="space-y-4">
+      <div className="border border-border bg-card p-6">
         <h3 className="text-sm font-semibold">Become a validator</h3>
         <p className="mt-1 text-sm text-muted-foreground">
-          Deposit TNZO and your node will help secure the network. Deposits
-          are refundable when you exit. Requires uptime — keep this app
-          running.
+          Deposit TNZO and your node will help secure the network. You earn
+          rewards from block production; deposits are refundable when you
+          exit (subject to an unbonding window). Requires uptime — keep
+          this app running.
         </p>
-      </div>
-      <div>
-        <label className="text-[10px] uppercase tracking-wider text-muted-foreground">
-          Deposit amount (TNZO)
-        </label>
-        <div className="mt-1 flex items-center gap-2">
-          <input
-            type="number"
-            min="100"
-            step="100"
-            value={amount}
-            onChange={(e) => setAmount(e.target.value)}
-            disabled={busy}
-            className="w-40 border border-border bg-background px-2 py-1 text-sm font-mono focus:outline-none focus:border-foreground"
-          />
-          <span className="text-xs text-muted-foreground">
-            Balance: <span className="font-mono">{wallet.balance_display}</span> TNZO
-          </span>
+        <div className="mt-3 flex items-center gap-2 text-xs">
+          <StepDot active={step === "preflight"} done={step !== "preflight"} label="Pre-flight" />
+          <StepArrow />
+          <StepDot active={step === "risks"} done={step === "deposit" || step === "submitted"} label="Risks" />
+          <StepArrow />
+          <StepDot active={step === "deposit"} done={step === "submitted"} label="Deposit" />
+          <StepArrow />
+          <StepDot active={step === "submitted"} done={false} label="Live" />
         </div>
-        {insufficient && (
-          <p className="mt-1 text-xs text-destructive">
-            Insufficient balance.
-          </p>
-        )}
       </div>
+
+      {step === "preflight" && (
+        <div className="space-y-3 border border-border bg-card p-6">
+          <h4 className="text-sm font-semibold">Pre-flight checks</h4>
+          <PreflightItem
+            label="Network connectivity"
+            ok={(nodeStatus?.peer_count ?? 0) >= 1}
+            detail={`Peers: ${nodeStatus?.peer_count ?? "checking…"}`}
+          />
+          <PreflightItem
+            label="Chain sync"
+            ok={(nodeStatus?.block_height ?? 0) > 0}
+            detail={`Height: ${(nodeStatus?.block_height ?? 0).toLocaleString()}`}
+          />
+          <PreflightItem
+            label="Sufficient balance"
+            ok={balanceTnzo >= 100}
+            detail={`${wallet.balance_display} TNZO available · minimum 100 TNZO recommended`}
+          />
+          <div className="pt-2">
+            <button
+              type="button"
+              onClick={() => setStep("risks")}
+              className="border border-border bg-primary px-4 py-2 text-xs font-medium uppercase tracking-wider text-primary-foreground hover:opacity-90"
+            >
+              Continue
+            </button>
+          </div>
+        </div>
+      )}
+
+      {step === "risks" && (
+        <div className="space-y-4 border border-border bg-card p-6">
+          <h4 className="text-sm font-semibold">Acknowledge each risk</h4>
+          <p className="text-xs text-muted-foreground">
+            Tick each item separately. Each is one concrete fact you should understand.
+          </p>
+          <AckCheckbox
+            checked={acks.deposit}
+            onChange={(v) => setAcks((a) => ({ ...a, deposit: v }))}
+            label="My deposit is locked while I'm an active validator."
+            hint="You can request exit at any time, but funds remain locked through the unbonding window."
+          />
+          <AckCheckbox
+            checked={acks.uptime}
+            onChange={(v) => setAcks((a) => ({ ...a, uptime: v }))}
+            label="Sustained downtime reduces my rewards."
+            hint="Brief outages are fine. Long absences mean missed block-production duties and lower earnings."
+          />
+          <AckCheckbox
+            checked={acks.slashing}
+            onChange={(v) => setAcks((a) => ({ ...a, slashing: v }))}
+            label="Equivocation (signing conflicting blocks) is slashable."
+            hint="Running the same validator key on two machines, or attacking the network, can burn a portion of the deposit. Standard operation can't trigger this."
+          />
+          <AckCheckbox
+            checked={acks.exit}
+            onChange={(v) => setAcks((a) => ({ ...a, exit: v }))}
+            label="Exiting takes time. There's an unbonding window."
+            hint="Funds become withdrawable after the unbonding window completes; no rewards during this window."
+          />
+          {error && <p className="text-sm text-destructive">{error}</p>}
+          <div className="flex justify-between pt-2">
+            <button
+              type="button"
+              onClick={() => setStep("preflight")}
+              className="border border-border bg-secondary px-3 py-2 text-xs font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent"
+            >
+              Back
+            </button>
+            <button
+              type="button"
+              onClick={() => setStep("deposit")}
+              disabled={!acksOk}
+              className="border border-border bg-primary px-4 py-2 text-xs font-medium uppercase tracking-wider text-primary-foreground hover:opacity-90 disabled:opacity-50"
+            >
+              Continue
+            </button>
+          </div>
+        </div>
+      )}
+
+      {step === "deposit" && (
+        <div className="space-y-4 border border-border bg-card p-6">
+          <h4 className="text-sm font-semibold">Deposit</h4>
+          <div>
+            <label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              Amount (TNZO)
+            </label>
+            <div className="mt-1 flex items-center gap-2">
+              <input
+                type="number"
+                min="100"
+                step="100"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                disabled={busy}
+                className="w-40 border border-border bg-background px-2 py-1 text-sm font-mono focus:outline-none focus:border-foreground"
+              />
+              <span className="text-xs text-muted-foreground">
+                Balance: <span className="font-mono">{wallet.balance_display}</span> TNZO
+              </span>
+            </div>
+            {insufficient && (
+              <p className="mt-1 text-xs text-destructive">Insufficient balance.</p>
+            )}
+          </div>
+          {error && <p className="text-sm text-destructive">{error}</p>}
+          <div className="flex justify-between pt-2">
+            <button
+              type="button"
+              onClick={() => setStep("risks")}
+              disabled={busy}
+              className="border border-border bg-secondary px-3 py-2 text-xs font-medium uppercase tracking-wider text-secondary-foreground hover:bg-accent disabled:opacity-50"
+            >
+              Back
+            </button>
+            <button
+              type="button"
+              onClick={submit}
+              disabled={busy || insufficient || requested <= 0}
+              className="border border-emerald-600/40 bg-emerald-600 px-4 py-2 text-xs font-medium uppercase tracking-wider text-white hover:bg-emerald-700 disabled:opacity-50"
+            >
+              {busy ? "Submitting…" : `Deposit ${amount} TNZO`}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {step === "submitted" && (
+        <>
+          <div className="space-y-3 border border-emerald-600/40 bg-emerald-600/10 p-6 text-emerald-900 dark:text-emerald-200">
+            <h4 className="text-sm font-semibold">Deposit submitted</h4>
+            <p className="text-sm">
+              Your validator deposit was accepted. You'll be admitted as a
+              validator at the next epoch boundary; from that point on
+              you'll help secure the network and earn rewards.
+            </p>
+            {txHash && (
+              <p className="break-all text-xs font-mono text-emerald-700 dark:text-emerald-300">
+                Tx: {txHash}
+              </p>
+            )}
+            <p className="text-xs text-muted-foreground">
+              Keep this app running — validators that go offline for sustained
+              periods miss reward duties.
+            </p>
+          </div>
+          <ValidatorExitPanel onExited={() => setStep("preflight")} />
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Exit / unbonding panel. Calls tenzro_unstake which queues the
+ *  validator's deposit into the unbonding window; rewards stop, funds
+ *  become withdrawable after the chain's configured delay. */
+function ValidatorExitPanel({ onExited }: { onExited: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  async function exit() {
+    let ok = false;
+    try {
+      const { confirm } = await import("@tauri-apps/plugin-dialog");
+      ok = await confirm(
+        "Exit validator? Your deposit enters the unbonding window. No rewards during this period; funds become withdrawable after the window completes.",
+        { title: "Exit validator", kind: "warning" },
+      );
+    } catch {
+      ok = window.confirm("Exit validator? Deposit goes into unbonding window.");
+    }
+    if (!ok) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const resp = await invoke<any>("rpc_call", {
+        args: { method: "tenzro_unstake", params: {} },
+      });
+      const err = resp?.error;
+      if (err) throw new Error(err.message ?? "unstake failed");
+      setSuccess("Exit queued. Funds will be withdrawable when the unbonding window completes.");
+      setTimeout(onExited, 2000);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="border border-border bg-card p-6 space-y-3">
+      <h4 className="text-sm font-semibold">Exit validator</h4>
+      <p className="text-xs text-muted-foreground">
+        Stop validating + queue your deposit for refund. After the
+        unbonding window completes, the deposit is withdrawable to your
+        wallet. You'll see this transition reflected in the wallet
+        balance once finalised.
+      </p>
       {error && <p className="text-sm text-destructive">{error}</p>}
       {success && <p className="text-sm text-emerald-600 dark:text-emerald-400">{success}</p>}
-      <div>
-        <button
-          type="button"
-          onClick={submit}
-          disabled={busy || insufficient || requested <= 0}
-          className="border border-emerald-600/40 bg-emerald-600 px-4 py-2 text-xs font-medium uppercase tracking-wider text-white hover:bg-emerald-700 disabled:opacity-50"
-        >
-          {busy ? "Submitting…" : `Deposit ${amount} TNZO`}
-        </button>
+      <button
+        type="button"
+        onClick={exit}
+        disabled={busy}
+        className="border border-amber-600/40 bg-amber-600/10 px-3 py-1.5 text-xs font-medium uppercase tracking-wider text-amber-700 dark:text-amber-300 hover:bg-amber-600/20 disabled:opacity-50"
+      >
+        {busy ? "Submitting exit…" : "Exit validator"}
+      </button>
+    </div>
+  );
+}
+
+function StepDot({ active, done, label }: { active: boolean; done: boolean; label: string }) {
+  return (
+    <span className="flex items-center gap-1.5">
+      <span
+        className={`h-2.5 w-2.5 rounded-full ${
+          done
+            ? "bg-emerald-500"
+            : active
+              ? "bg-primary"
+              : "bg-muted-foreground/30"
+        }`}
+      />
+      <span className={active || done ? "text-foreground" : "text-muted-foreground/70"}>
+        {label}
+      </span>
+    </span>
+  );
+}
+function StepArrow() {
+  return <span className="text-muted-foreground/40">→</span>;
+}
+
+function PreflightItem({ label, ok, detail }: { label: string; ok: boolean; detail: string }) {
+  return (
+    <div className="flex items-start gap-3 text-sm">
+      <span
+        className={`mt-0.5 inline-block h-3 w-3 rounded-full ${
+          ok ? "bg-emerald-500" : "bg-amber-500"
+        }`}
+      />
+      <div className="min-w-0 flex-1">
+        <div className="font-medium">{label}</div>
+        <div className="text-xs text-muted-foreground">{detail}</div>
       </div>
     </div>
+  );
+}
+
+function AckCheckbox({
+  checked,
+  onChange,
+  label,
+  hint,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+  hint: string;
+}) {
+  return (
+    <label className="flex cursor-pointer items-start gap-3">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-0.5"
+      />
+      <div className="min-w-0 flex-1 text-sm">
+        <div>{label}</div>
+        <div className="text-xs text-muted-foreground">{hint}</div>
+      </div>
+    </label>
   );
 }
 
