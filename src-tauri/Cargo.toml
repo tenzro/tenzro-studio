@@ -13,6 +13,15 @@ homepage = "https://tenzro.com"
 # nested next to the tenzro-network monorepo during development.
 [workspace]
 
+# Production release profile. `strip` drops debug symbols so the shipped
+# binary is tens of MB rather than ~300 MB (the unstripped size blew up the
+# bundle pipeline on a near-full disk). `lto`/`codegen-units` trade build time
+# for a leaner, faster binary — fine for a release artifact, not used in dev.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

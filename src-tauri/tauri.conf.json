@@ -11,6 +11,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["app", "dmg", "msi", "nsis", "deb", "rpm", "appimage"],
     "externalBin": [
       "binaries/llama-server"
@@ -70,7 +71,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost https: http: ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     },
     "trayIcon": {
       "iconPath": "icons/icon.png",
@@ -88,7 +89,7 @@
     },
     "updater": {
       "active": true,
-      "pubkey": "PUT_TAURI_UPDATER_PUBKEY_HERE",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUyNDdBQ0U1NUM0ODJEMEMKUldRTUxVaGM1YXhINGxVQ2pBRzZHM3lPK2x0T2k5RVVhNERpQVdLdDA0dGdhK2tKQ2pzMzFLamMK",
       "endpoints": [
         "https://tenzro.com/studio/updates/{{target}}/{{arch}}/{{current_version}}"
       ],

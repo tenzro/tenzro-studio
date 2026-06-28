@@ -26,6 +26,16 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# Signing / updater keys + provisioning profiles — NEVER commit. The Tauri
+# updater private key lives outside the repo (~/.tauri); these patterns are a
+# defensive guard against accidental in-tree commits.
+*.key
+!**/jinja/**/*.key
+*.pem
+*.p12
+*.provisionprofile
+src-tauri/embedded.provisionprofile
+
 # Local cargo patches (per CONTRIBUTING.md, these stay machine-local)
 .cargo/config.toml
 
