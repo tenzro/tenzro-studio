@@ -10,12 +10,17 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-/** Result of `device_create_passkey` — public key info that
- *  `tenzro_enrollPasskey` accepts as `passkey_public_key_hex`. */
+/** Result of `device_create_passkey` — both legs of the hybrid passkey
+ *  custody key, plus the credential id, all of which `tenzro_enrollPasskey`
+ *  consumes directly. */
 export interface DeviceKeyInfo {
   label: string;
   /** Raw uncompressed SEC1 P-256 pubkey (x ‖ y, 64 bytes, no 0x04). */
   public_key_hex: string;
+  /** 1952-byte ML-DSA-65 verifying key of the post-quantum companion. */
+  ml_dsa_public_key_hex: string;
+  /** Stable credential id (SHA-256 of the device-key label). */
+  credential_id_hex: string;
 }
 
 /** Result of `tenzro_enrollPasskey` — the smart-account address +
@@ -45,28 +50,38 @@ export interface EnrollResult {
  *  and the embedded node persists the registration to local
  *  RocksDB. Network sync registers it on-chain via gossip.
  *
- *  `mlDsaPublicKeyHex` is required (hybrid PQ leg). For now Studio
- *  sources it from a node-side helper that derives the ML-DSA seed
- *  from the same passkey credential id (deterministic, no extra
- *  secret to store). Until that helper ships, the caller must
- *  supply one.
+ *  The ML-DSA-65 companion (hybrid PQ leg) and credential id are
+ *  produced device-side by `device_create_passkey`: the companion seed
+ *  is sealed to the same Secure Enclave key, so no extra secret is
+ *  stored and the caller doesn't supply them.
  */
 export async function createWalletViaPasskey(args: {
   label: string;
   displayName?: string;
-  mlDsaPublicKeyHex: string;
-  credentialIdHex: string;
   salt?: number;
 }): Promise<EnrollResult> {
-  // Step 1: device-side ceremony.
+  // Step 1: device-side ceremony — mints the P-256 enclave key and seals
+  // the ML-DSA-65 companion seed to it, returning both public keys.
   const device = await invoke<DeviceKeyInfo>("device_create_passkey", {
     label: args.label,
   });
+  // Step 2: register on the operator.
+  return enrollPasskey(device, args.displayName, args.salt);
+}
 
-  // Step 2: register on the operator (via embedded-node in-process
-  // RPC). When the embedded node is offline-but-running, this still
-  // succeeds — registration persists locally and rebroadcasts on
-  // network resume.
+/** Register an already-minted device passkey on the operator (via the
+ *  embedded node's in-process RPC). Split out from
+ *  `createWalletViaPasskey` so callers that have already run
+ *  `device_create_passkey` (e.g. to force the user-presence ceremony)
+ *  don't mint a second enclave key.
+ *
+ *  Works when the embedded node is offline-but-running: registration
+ *  persists locally and rebroadcasts on network resume. */
+export async function enrollPasskey(
+  device: DeviceKeyInfo,
+  displayName?: string,
+  salt?: number,
+): Promise<EnrollResult> {
   const resp = await invoke<{ result?: EnrollResult; error?: { message: string } }>(
     "rpc_call",
     {
@@ -74,11 +89,11 @@ export async function createWalletViaPasskey(args: {
         method: "tenzro_enrollPasskey",
         params: [
           {
-            display_name: args.displayName,
+            display_name: displayName,
             passkey_public_key_hex: device.public_key_hex,
-            credential_id_hex: args.credentialIdHex,
-            ml_dsa_public_key_hex: args.mlDsaPublicKeyHex,
-            salt: args.salt ?? 0,
+            credential_id_hex: device.credential_id_hex,
+            ml_dsa_public_key_hex: device.ml_dsa_public_key_hex,
+            salt: salt ?? 0,
           },
         ],
       },
@@ -101,6 +116,20 @@ export async function signPrehashWithPasskey(args: {
   prehashHex: string;
 }): Promise<string> {
   return invoke<string>("device_sign_with_passkey", {
+    label: args.label,
+    prehashHex: args.prehashHex,
+  });
+}
+
+/** Both signature legs over a 32-byte EIP-712 prehash: the classical
+ *  P-256 `r ‖ s` and the post-quantum ML-DSA-65 companion signature.
+ *  One biometric prompt covers both. `tenzro_signWithPasskey` consumes
+ *  both for hybrid custody verification. */
+export async function signHybridWithPasskey(args: {
+  label: string;
+  prehashHex: string;
+}): Promise<{ p256_signature_hex: string; ml_dsa_signature_hex: string }> {
+  return invoke("device_sign_hybrid_with_passkey", {
     label: args.label,
     prehashHex: args.prehashHex,
   });
