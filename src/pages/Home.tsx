@@ -524,8 +524,12 @@ function WalletProvider({ children }: { children: ReactNode }) {
         const s = await invoke<WalletStatus>("wallet_status");
         if (!cancelled) setStatus(s);
       } catch (e) {
-        // Node may not be up yet — keep polling.
-        if (!cancelled && status === null) setStatus({
+        // Node not up yet (or a transient command error). Report
+        // not-ready WITHOUT gating on the closure-captured `status`,
+        // which is stale across the setTimeout chain — gating on it
+        // would freeze the chip permanently after the first error even
+        // once the node comes up. A later successful poll overwrites this.
+        if (!cancelled) setStatus({
           exists: false, address: "", display_address: "",
           balance_wei: "0", balance_display: "—", node_ready: false,
         });

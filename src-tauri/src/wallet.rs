@@ -95,27 +95,43 @@ pub async fn wallet_status(state: State<'_, AppState>) -> Result<WalletStatusVie
         });
     };
 
-    use tenzro_wallet::traits::WalletService;
-    let ws: &tenzro_wallet::service::TenzroWalletService = wallet_service.as_ref();
-    let ids = WalletService::list_wallets(ws)
-        .await
-        .map_err(|e| format!("list_wallets failed: {}", e))?;
-
-    let Some(first_id) = ids.into_iter().next() else {
-        return Ok(WalletStatusView {
-            exists: false,
-            address: String::new(),
-            display_address: String::new(),
-            balance_wei: "0".into(),
-            balance_display: "—".into(),
-            node_ready: true,
-        });
+    // The node is up, so node_ready is true from here on regardless of what
+    // the keystore reports. A wallet that's listed-but-unreadable — e.g. a
+    // FROST share persisted under a password on a prior provisioned run, now
+    // opened by an ephemeral (passwordless) keystore that can't decrypt it —
+    // must NOT throw: that would make the chip poll error forever and read as
+    // "node starting". Degrade to "no usable wallet" so the UI offers Create.
+    let not_ready_but_no_wallet = || WalletStatusView {
+        exists: false,
+        address: String::new(),
+        display_address: String::new(),
+        balance_wei: "0".into(),
+        balance_display: "—".into(),
+        node_ready: true,
     };
 
-    let wallet = WalletService::get_wallet(ws, &first_id)
-        .await
-        .map_err(|e| format!("get_wallet failed: {}", e))?
-        .ok_or_else(|| "wallet listed but not found in keystore".to_string())?;
+    use tenzro_wallet::traits::WalletService;
+    let ws: &tenzro_wallet::service::TenzroWalletService = wallet_service.as_ref();
+    let ids = match WalletService::list_wallets(ws).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!("wallet_status: list_wallets failed ({e}); reporting no wallet");
+            return Ok(not_ready_but_no_wallet());
+        }
+    };
+
+    let Some(first_id) = ids.into_iter().next() else {
+        return Ok(not_ready_but_no_wallet());
+    };
+
+    let wallet = match WalletService::get_wallet(ws, &first_id).await {
+        Ok(Some(w)) => w,
+        Ok(None) => return Ok(not_ready_but_no_wallet()),
+        Err(e) => {
+            tracing::warn!("wallet_status: get_wallet failed ({e}); likely an undecryptable share under an ephemeral keystore — reporting no wallet");
+            return Ok(not_ready_but_no_wallet());
+        }
+    };
 
     let hex_address = format!("0x{}", hex::encode(wallet.public_key.as_bytes()));
 
