@@ -22,7 +22,7 @@
 //! <https://github.com/tauri-apps/tauri/issues/13498>.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, State};
@@ -49,6 +49,11 @@ pub struct UiHeartbeat {
     /// work in a [`HeartbeatPause`] so the watchdog stands down for the
     /// duration. A counter (not a bool) so concurrent/nested prompts compose.
     pause_depth: AtomicUsize,
+    /// Document hidden (window occluded / backgrounded / minimized). macOS
+    /// throttles timers in hidden WebViews, so while this is true the watchdog
+    /// stands down — a hidden renderer is alive, just not pinging on cadence.
+    /// Set/cleared by the `ui_visibility` command on `visibilitychange`.
+    hidden: AtomicBool,
 }
 
 impl UiHeartbeat {
@@ -56,7 +61,21 @@ impl UiHeartbeat {
         Arc::new(Self {
             last_seen_ms: AtomicU64::new(now_ms()),
             pause_depth: AtomicUsize::new(0),
+            hidden: AtomicBool::new(false),
         })
+    }
+
+    fn set_hidden(&self, hidden: bool) {
+        self.hidden.store(hidden, Ordering::Relaxed);
+        // Refresh on becoming visible so accumulated stale age doesn't trip the
+        // watchdog on the first poll after the window comes back to the front.
+        if !hidden {
+            self.bump();
+        }
+    }
+
+    fn is_hidden(&self) -> bool {
+        self.hidden.load(Ordering::Relaxed)
     }
 
     fn bump(&self) {
@@ -105,10 +124,21 @@ fn now_ms() -> u64 {
 }
 
 /// Tauri command — frontend calls this every ~2s via
-/// `invoke('ui_alive')` from a `requestAnimationFrame` loop.
+/// `invoke('ui_alive')` from a `setInterval` loop.
 #[tauri::command]
 pub fn ui_alive(hb: State<'_, Arc<UiHeartbeat>>) {
     hb.bump();
+}
+
+/// Tauri command — frontend reports document visibility on `visibilitychange`.
+/// While hidden (window occluded / backgrounded / minimized) macOS may throttle
+/// the page's timers, so we pause the timeout check to avoid a false-positive
+/// shutdown of a perfectly live renderer. Reuses the same pause depth as the
+/// biometric-prompt guard; balanced add/sub keeps the counter correct across
+/// rapid hide/show toggles.
+#[tauri::command]
+pub fn ui_visibility(hb: State<'_, Arc<UiHeartbeat>>, hidden: bool) {
+    hb.set_hidden(hidden);
 }
 
 /// Spawn the polling watchdog. Bumps the heartbeat immediately so the
@@ -126,7 +156,7 @@ pub fn spawn_watchdog(app: &AppHandle, hb: Arc<UiHeartbeat>) {
             // the UI ping loop. While a device-key op holds a pause guard,
             // keep the heartbeat fresh and skip the timeout check so we don't
             // kill the app mid-Touch-ID.
-            if hb.is_paused() {
+            if hb.is_paused() || hb.is_hidden() {
                 hb.bump();
                 continue;
             }
