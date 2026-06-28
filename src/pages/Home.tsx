@@ -13,7 +13,8 @@ import { Markdown } from "@/components/Markdown";
 import { EmptyState, ModelRowSkeleton } from "@/components/Skeleton";
 import { ConversationSidebar } from "@/components/ConversationSidebar";
 import { WalletDrawer } from "@/components/WalletDrawer";
-import { signPrehashWithPasskey } from "@/lib/passkey";
+import { signPrehashWithPasskey, enrollPasskey, type DeviceKeyInfo } from "@/lib/passkey";
+import { pickProvider } from "@/lib/routing";
 
 function safeParseStats(s: string): AssistantStats | undefined {
   try { return JSON.parse(s) as AssistantStats; } catch { return undefined; }
@@ -89,13 +90,51 @@ interface AssistantStats {
 /** Mirror of `NodeStatusView` in src-tauri/src/node_lifecycle.rs. */
 interface NodeStatus {
   state: string;
-  role: string;
+  /** Comma-joined set of roles this node serves (e.g.
+   * "validator,model_provider,storage"). One node, one stake, many roles. */
+  roles: string;
   block_height: number;
   peer_count: number;
   uptime_secs: number;
   tee_capable: boolean;
   iroh_enabled: boolean;
   connectivity: "connecting" | "syncing" | "connected";
+}
+
+/** Human label for a comma-joined role set, e.g.
+ * "validator,model_provider" -> "Validator, AI". */
+function formatRoles(roles: string | undefined): string {
+  if (!roles) return "—";
+  const labels: Record<string, string> = {
+    validator: "Validator",
+    model_provider: "AI",
+    ai: "AI",
+    tee_provider: "TEE",
+    tee: "TEE",
+    storage: "Storage",
+    full_node: "Full node",
+    light_client: "Light client",
+  };
+  return roles
+    .split(",")
+    .map((r) => r.trim())
+    .filter(Boolean)
+    .map((r) => labels[r] ?? r)
+    .join(", ");
+}
+
+/** Union the node's current role set with `add`, returning a comma-joined
+ * string for `request_role_change`. The node replaces its role set wholesale,
+ * so the GUI sends the full desired set — one stake, many roles. */
+function withRole(current: string | undefined, add: string): string {
+  const set = new Set(
+    (current ?? "")
+      .split(",")
+      .map((r) => r.trim())
+      .filter(Boolean),
+  );
+  set.add(add);
+  return Array.from(set).join(",");
 }
 
 /** Subset of the model record returned by `tenzro_listModels`. */
@@ -125,12 +164,7 @@ interface ModelInfo {
 }
 
 /** Subset of `tenzro_listModelEndpoints` entries. */
-interface ModelEndpoint {
-  instance_id: string;
-  model_id: string;
-  provider?: string;
-  api_url?: string;
-}
+type ModelEndpoint = import("../lib/routing").ModelEndpoint;
 
 /** Subset of `tenzro_getDownloadProgress` state. Field names mirror the
  *  Rust `ModelDownloadStatus` struct in `crates/tenzro-node/src/node.rs`. */
@@ -143,7 +177,7 @@ interface DownloadProgress {
   error?: string | null;
 }
 
-type CardId = "use-network" | "run-local" | "serve" | "validate";
+type CardId = "use-network" | "run-local" | "serve" | "provide" | "validate";
 
 interface Card {
   id: CardId;
@@ -176,6 +210,14 @@ const CARDS: Card[] = [
     body:
       "Pick a model, advertise it to the network as a provider, " +
       "earn TNZO from AI requests. Requires capable hardware.",
+  },
+  {
+    id: "provide",
+    title: "Provide storage & compute",
+    tagline: "Earn TNZO by hosting storage and renting out compute",
+    body:
+      "Offer your spare disk and CPU/GPU to the network. One stake, " +
+      "many roles — paid per byte stored and per epoch rented.",
   },
   {
     id: "validate",
@@ -245,33 +287,46 @@ export default function Home() {
 
   return (
     <WalletProvider>
-    <div className="flex min-h-screen flex-col">
-      <main className="mx-auto w-full max-w-5xl flex-1 px-8 pt-16 pb-16">
-        <header className="mb-12">
-          <h1 className="text-3xl font-semibold tracking-tight">
-            Tenzro Studio
+    <div className="tnz-ambient flex min-h-screen flex-col">
+      <main className="mx-auto w-full max-w-5xl flex-1 px-8 pt-24 pb-16">
+        <header className="mb-16 max-w-2xl">
+          <p className="tnz-eyebrow">Tenzro Studio</p>
+          <h1 className="mt-5 text-5xl font-semibold leading-[1.05] tracking-tight">
+            Run, serve, and secure{" "}
+            <span className="tnz-dim">intelligence on the network.</span>
           </h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Run, serve, and contribute AI to the Tenzro Network.
+          <p className="mt-5 max-w-xl text-[15px] leading-relaxed text-muted-foreground">
+            One client for the whole Tenzro Network — chat with models others
+            serve, run them privately on your own hardware, earn by serving,
+            or stake to validate.
           </p>
         </header>
 
         <section>
-          <h2 className="mb-6 text-sm font-medium uppercase tracking-wider text-muted-foreground">
-            What do you want to do?
-          </h2>
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <p className="tnz-eyebrow mb-5">Choose a path</p>
+          <div className="grid grid-cols-1 gap-px border border-border bg-border sm:grid-cols-2">
             {CARDS.map((card) => (
               <button
                 key={card.id}
                 onClick={() => setPicked(card.id)}
-                className="border border-border bg-card p-6 text-left transition hover:bg-accent"
+                className="group relative bg-background p-7 text-left transition-colors hover:bg-secondary"
               >
-                <h3 className="text-base font-medium">{card.title}</h3>
+                <span className="tnz-eyebrow block">{cardGlyph(card.id)}</span>
+                <h3 className="mt-4 text-lg font-medium tracking-tight">
+                  {card.title}
+                </h3>
                 <p className="mt-1 text-sm text-muted-foreground">
                   {card.tagline}
                 </p>
-                <p className="mt-3 text-sm leading-relaxed">{card.body}</p>
+                <p className="mt-4 text-sm leading-relaxed text-muted-foreground/90">
+                  {card.body}
+                </p>
+                {/* Hairline brand-accent reveal on hover — the one place the
+                    periwinkle touches the cards. */}
+                <span
+                  aria-hidden
+                  className="absolute inset-x-0 bottom-0 h-px scale-x-0 bg-[var(--brand)] transition-transform duration-200 group-hover:scale-x-100"
+                />
               </button>
             ))}
           </div>
@@ -282,6 +337,19 @@ export default function Home() {
     </div>
     </WalletProvider>
   );
+}
+
+/** Two-letter mono glyph per card — a structural label that encodes the
+ *  action, not a decorative 01/02 sequence (these paths are parallel,
+ *  not ordered). */
+function cardGlyph(id: CardId): string {
+  switch (id) {
+    case "use-network": return "NET";
+    case "run-local": return "LOC";
+    case "serve": return "SRV";
+    case "provide": return "PRV";
+    case "validate": return "VAL";
+  }
 }
 
 function StatusBar({ status }: { status: NodeStatus | null }) {
@@ -372,7 +440,7 @@ function StatusBar({ status }: { status: NodeStatus | null }) {
         </span>
       </span>
       <Sep />
-      <span className="text-muted-foreground/70">{status.role}</span>
+      <span className="text-muted-foreground/70">{formatRoles(status.roles)}</span>
       <Sep />
       <span className="text-muted-foreground/70">
         Uptime {Math.floor(status.uptime_secs / 60)}m
@@ -522,7 +590,10 @@ function WalletChip() {
       // Mint a biometry-gated P-256 key in the Secure Enclave. Note:
       // key *generation* does NOT trigger Touch ID on macOS — only key
       // *use* (signing) does.
-      const dk = await invoke<{ label: string; public_key_hex: string }>(
+      // Mints the P-256 enclave key AND seals an ML-DSA-65 post-quantum
+      // companion seed to it, returning both public keys + the credential
+      // id. Neither generation nor sealing triggers Touch ID.
+      const dk = await invoke<DeviceKeyInfo>(
         "device_create_passkey",
         { label },
       );
@@ -533,16 +604,19 @@ function WalletChip() {
       const challenge =
         "0000000000000000000000000000000000000000000000000000000000000001";
       await signPrehashWithPasskey({ label, prehashHex: challenge });
-      // Provision the MPC wallet on the embedded node. The passkey is
-      // now device-bound; future signing flows use
-      // `device_sign_with_passkey`. On-chain enrollment via
-      // `tenzro_enrollPasskey` (ML-DSA-65 hybrid PQ companion key) is
-      // wired in a later iteration.
+      // On-chain enrollment: registers a TDIP identity, CREATE2-deploys the
+      // smart account, and installs the WebAuthnValidator with the hybrid
+      // P-256 + ML-DSA-65 custody key. Persists locally and gossips on sync.
+      const enrolled = await enrollPasskey(dk, label);
+      // Provision the local MPC wallet on the embedded node. Future signing
+      // flows use `device_sign_hybrid_with_passkey` for both custody legs.
       await invoke<WalletStatus>("wallet_create");
       console.info(
         "Wallet created with device-bound passkey",
         label,
         dk.public_key_hex.slice(0, 16) + "…",
+        "→",
+        enrolled.smart_account_address,
       );
       refresh();
     } catch (e) {
@@ -608,16 +682,17 @@ interface CardFlowProps {
 function CardFlow({ cardId, onBack, status }: CardFlowProps) {
   const card = CARDS.find((c) => c.id === cardId)!;
   return (
-    <div className="flex min-h-screen flex-col">
+    <div className="tnz-ambient flex min-h-screen flex-col">
       <main className="mx-auto w-full max-w-5xl flex-1 px-8 pt-12 pb-16">
         <button
           onClick={onBack}
-          className="mb-8 text-xs uppercase tracking-wider text-muted-foreground hover:text-foreground"
+          className="tnz-eyebrow mb-8 inline-flex items-center gap-1.5 hover:text-foreground"
         >
-          ← Back
+          <span aria-hidden>←</span> Back
         </button>
-        <h1 className="text-2xl font-semibold">{card.title}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">{card.tagline}</p>
+        <p className="tnz-eyebrow">{cardGlyph(card.id)}</p>
+        <h1 className="mt-3 text-3xl font-semibold tracking-tight">{card.title}</h1>
+        <p className="mt-2 text-[15px] text-muted-foreground">{card.tagline}</p>
 
         <div className="mt-10">
           {cardId === "use-network" && (
@@ -629,6 +704,11 @@ function CardFlow({ cardId, onBack, status }: CardFlowProps) {
           {cardId === "serve" && (
             <RequireWallet reason="You need a wallet to receive TNZO payments from inference requests routed to your node.">
               <ServeFlow />
+            </RequireWallet>
+          )}
+          {cardId === "provide" && (
+            <RequireWallet reason="You need a wallet to receive TNZO payments for storage hosted and compute rented.">
+              <ProvideFlow />
             </RequireWallet>
           )}
           {cardId === "validate" && (
@@ -1089,7 +1169,9 @@ function ChatPane({
     return () => { cancelled = true; };
   }, []);
 
-  const provider = providers[0]; // pick the first one for now; routing logic lives in the node later
+  // Route to the healthiest, least-loaded provider rather than blindly
+  // taking the first. Recomputed when the endpoint list refreshes.
+  const provider = useMemo(() => pickProvider(providers), [providers]);
 
   if (!provider) {
     return (
@@ -1119,7 +1201,7 @@ function ChatPane({
   const estCostTnzo = Number(BigInt(inputTokensEstimate) * inWeiPerTok) / 1e18;
 
   async function send() {
-    if (!input.trim() || sending) return;
+    if (!input.trim() || sending || !provider) return;
 
     // Spending cap check: refuse if this request would push us past
     // the per-session cap. 0 = no cap.
@@ -1158,7 +1240,8 @@ function ChatPane({
         messages: next.map((m) => ({ role: m.role, content: m.content })),
         stream: false,
       });
-      const url = (provider.api_url ?? "").replace(/\/$/, "") + "/v1/chat/completions";
+      const base = provider.api_url ?? provider.api_endpoint ?? "";
+      const url = base.replace(/\/$/, "") + "/v1/chat/completions";
       const resp = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1189,7 +1272,7 @@ function ChatPane({
   return (
     <div>
       <BackBtn onClick={onBack} />
-      <ModelHeader model={model} extra={`via ${provider.provider ?? "remote"}`} />
+      <ModelHeader model={model} extra={`via ${provider.provider_name ?? provider.provider ?? "remote"}`} />
       <div className="mt-2 flex items-center justify-between gap-3 border border-border bg-card/40 px-4 py-2 text-xs">
         <div className="text-muted-foreground">
           {inWeiPerTok > 0n ? (
@@ -3038,7 +3121,10 @@ function RequireWallet({
       // Mint a biometry-gated P-256 key in the Secure Enclave. Note:
       // key *generation* does NOT trigger Touch ID on macOS — only key
       // *use* (signing) does.
-      const dk = await invoke<{ label: string; public_key_hex: string }>(
+      // Mints the P-256 enclave key AND seals an ML-DSA-65 post-quantum
+      // companion seed to it, returning both public keys + the credential
+      // id. Neither generation nor sealing triggers Touch ID.
+      const dk = await invoke<DeviceKeyInfo>(
         "device_create_passkey",
         { label },
       );
@@ -3049,16 +3135,19 @@ function RequireWallet({
       const challenge =
         "0000000000000000000000000000000000000000000000000000000000000001";
       await signPrehashWithPasskey({ label, prehashHex: challenge });
-      // Provision the MPC wallet on the embedded node. The passkey is
-      // now device-bound; future signing flows use
-      // `device_sign_with_passkey`. On-chain enrollment via
-      // `tenzro_enrollPasskey` (ML-DSA-65 hybrid PQ companion key) is
-      // wired in a later iteration.
+      // On-chain enrollment: registers a TDIP identity, CREATE2-deploys the
+      // smart account, and installs the WebAuthnValidator with the hybrid
+      // P-256 + ML-DSA-65 custody key. Persists locally and gossips on sync.
+      const enrolled = await enrollPasskey(dk, label);
+      // Provision the local MPC wallet on the embedded node. Future signing
+      // flows use `device_sign_hybrid_with_passkey` for both custody legs.
       await invoke<WalletStatus>("wallet_create");
       console.info(
         "Wallet created with device-bound passkey",
         label,
         dk.public_key_hex.slice(0, 16) + "…",
+        "→",
+        enrolled.smart_account_address,
       );
       refresh();
     } catch (e) {
@@ -3114,9 +3203,283 @@ function RequireWallet({
 /** Minimal Serve flow: pick a downloaded model and advertise it to the
  *  network as a provider. Uses tenzro_serveModel + tenzro_registerProvider
  *  via the existing rpc_call bridge. */
+type ServeVisibility = "network" | "private";
+type ServeOptions = { forceSingle?: boolean; userForced?: boolean; visibility?: ServeVisibility };
+
+type ClusterPreview = {
+  fit: "RunLocal" | "ClusterRequired" | "ClusterForced";
+  forms_cluster: boolean;
+  force_single: boolean;
+  user_forced: boolean;
+  single_box_fit: string | null;
+  model_shape: { layers: number; hidden_dim: number; total_vram_gb: number };
+  members: {
+    address: string;
+    vram_gb: number;
+    backend: string;
+    cap_key: string;
+    reachability: string;
+    is_head: boolean;
+  }[];
+  rejected: { address: string; reason: ClusterRejectReason }[];
+  stages: { address: string; start_layer: number; end_layer: number; tensor_split: number }[];
+  activation_bytes_per_token: number;
+};
+type ClusterRejectReason =
+  | { kind: "commit_mismatch"; expected: string; found: string }
+  | { kind: "not_data_plane_reachable"; reachability: string }
+  | { kind: "insufficient_vram"; offered_gb: number; needed_gb: number };
+
+function shortAddr(hex: string): string {
+  const h = hex.startsWith("0x") ? hex.slice(2) : hex;
+  if (h.length <= 10) return h;
+  return `${h.slice(0, 6)}…${h.slice(-4)}`;
+}
+
+function rejectLabel(r: ClusterRejectReason): string {
+  switch (r.kind) {
+    case "commit_mismatch":
+      return `build mismatch (runs ${r.found.slice(0, 7)}, cluster needs ${r.expected.slice(0, 7)})`;
+    case "not_data_plane_reachable":
+      return `not directly reachable (${r.reachability.replace(/_/g, " ")})`;
+    case "insufficient_vram":
+      return `too little memory (${r.offered_gb.toFixed(1)} GB, needs ≥ ${r.needed_gb.toFixed(2)} GB)`;
+  }
+}
+
+function reachLabel(r: string): string {
+  switch (r) {
+    case "local_direct": return "LAN";
+    case "direct": return "direct";
+    case "relay_only": return "relay";
+    case "symmetric_nat": return "NAT";
+    default: return r;
+  }
+}
+
+// Assisted cluster setup. Fetches the node's dry-run plan for one model and
+// lets the operator confirm or override it before serving. Shows the fit
+// decision, discovered members, the proposed VRAM-weighted layer split, and
+// any rejected members with the reason.
+function ClusterPreviewPanel({
+  modelId,
+  busy,
+  onServe,
+}: {
+  modelId: string;
+  busy: boolean;
+  onServe: (opts: ServeOptions) => void;
+}) {
+  const [preview, setPreview] = useState<ClusterPreview | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [forceCluster, setForceCluster] = useState(false);
+  const [forceSingle, setForceSingle] = useState(false);
+  const [visibility, setVisibility] = useState<ServeVisibility>("network");
+
+  useEffect(() => {
+    let cancelled = false;
+    setPreview(null);
+    setError(null);
+    const load = async () => {
+      try {
+        const resp = await invoke<any>("rpc_call", {
+          args: {
+            method: "tenzro_clusterPreview",
+            params: { model_id: modelId, user_forced: forceCluster, force_single: forceSingle },
+          },
+        });
+        if (cancelled) return;
+        if (resp?.error) { setError(resp.error.message ?? "preview failed"); return; }
+        setPreview(resp?.result ?? null);
+      } catch (e) {
+        if (!cancelled) setError(String(e));
+      }
+    };
+    load();
+    return () => { cancelled = true; };
+  }, [modelId, forceCluster, forceSingle]);
+
+  const addrName = (addr: string, isHead: boolean) =>
+    isHead ? "This machine" : shortAddr(addr);
+
+  if (error) {
+    return (
+      <div className="border-t border-border p-4 text-xs text-muted-foreground">
+        Couldn’t plan a cluster for this model: <span className="text-destructive">{error}</span>
+      </div>
+    );
+  }
+  if (!preview) {
+    return (
+      <div className="border-t border-border p-4 text-xs text-muted-foreground">
+        Inspecting hardware and discovering members…
+      </div>
+    );
+  }
+
+  const headByAddr = new Map(preview.members.map((m) => [m.address, m.is_head]));
+  const memberByAddr = new Map(preview.members.map((m) => [m.address, m]));
+  const fitsLocally = preview.single_box_fit != null;
+  const willCluster = preview.forms_cluster;
+
+  return (
+    <div className="space-y-4 border-t border-border p-4">
+      {/* Fit verdict + model shape. */}
+      <div>
+        <div className="tnz-eyebrow">Placement</div>
+        <p className="mt-1 text-sm">
+          {preview.fit === "RunLocal" && (
+            <>Fits on <span className="font-medium">this machine</span> — no cluster needed. Serving as a single node is faster.</>
+          )}
+          {preview.fit === "ClusterRequired" && (
+            <>Too large for any single member. It will be <span className="font-medium">split across {preview.stages.length} machines</span>.</>
+          )}
+          {preview.fit === "ClusterForced" && (
+            <>Fits locally, but you chose to <span className="font-medium">split across {preview.stages.length} machines</span>.</>
+          )}
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {preview.model_shape.layers} layers · {preview.model_shape.total_vram_gb.toFixed(1)} GB ·{" "}
+          {(preview.activation_bytes_per_token / 1024).toFixed(1)} KB/token across boundaries
+        </p>
+      </div>
+
+      {/* Discovered members. */}
+      <div>
+        <div className="tnz-eyebrow">Discovered members ({preview.members.length})</div>
+        <ul className="mt-2 grid grid-cols-1 gap-px border border-border bg-border">
+          {preview.members.map((m) => (
+            <li key={m.address} className="flex items-center justify-between gap-3 bg-card px-3 py-2 text-xs">
+              <span className="flex items-center gap-2">
+                <span className="font-medium">{addrName(m.address, m.is_head)}</span>
+                {m.is_head && (
+                  <span className="border border-border px-1 py-0.5 text-[9px] uppercase tracking-wider text-muted-foreground">head</span>
+                )}
+              </span>
+              <span className="font-mono tabular-nums text-muted-foreground">
+                {m.vram_gb.toFixed(1)} GB · {m.backend} · {reachLabel(m.reachability)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      {/* Proposed layer split (only when a cluster forms). */}
+      {willCluster && preview.stages.length > 0 && (
+        <div>
+          <div className="tnz-eyebrow">Proposed layer split</div>
+          <ul className="mt-2 space-y-1">
+            {preview.stages.map((s, i) => {
+              const m = memberByAddr.get(s.address);
+              const span = s.end_layer - s.start_layer;
+              const pct = (span / preview.model_shape.layers) * 100;
+              return (
+                <li key={s.address} className="text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-medium">
+                      {i + 1}. {addrName(s.address, headByAddr.get(s.address) ?? false)}
+                    </span>
+                    <span className="font-mono tabular-nums text-muted-foreground">
+                      layers {s.start_layer}–{s.end_layer - 1} ({span})
+                    </span>
+                  </div>
+                  <div className="mt-1 h-1 w-full bg-secondary">
+                    <div className="h-1" style={{ width: `${pct}%`, background: "var(--brand)" }} />
+                  </div>
+                  {m && (
+                    <div className="mt-0.5 text-[10px] text-muted-foreground">
+                      {m.backend} · {m.vram_gb.toFixed(1)} GB · {reachLabel(m.reachability)}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
+      {/* Rejected members. */}
+      {preview.rejected.length > 0 && (
+        <div>
+          <div className="tnz-eyebrow">Not eligible ({preview.rejected.length})</div>
+          <ul className="mt-2 space-y-1">
+            {preview.rejected.map((r) => (
+              <li key={r.address} className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground/70">{shortAddr(r.address)}</span>
+                <span>{rejectLabel(r.reason)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Overrides. */}
+      <div className="space-y-2">
+        <div className="tnz-eyebrow">Options</div>
+        {fitsLocally && !forceSingle && (
+          <label className="flex items-center gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={forceCluster}
+              onChange={(e) => setForceCluster(e.target.checked)}
+              className="accent-[#6b79aa]"
+            />
+            <span>Split across the cluster anyway (slower, but frees memory on this machine)</span>
+          </label>
+        )}
+        {willCluster && (
+          <label className="flex items-center gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={forceSingle}
+              onChange={(e) => { setForceSingle(e.target.checked); if (e.target.checked) setForceCluster(false); }}
+              className="accent-[#6b79aa]"
+            />
+            <span>Force single node instead (only if it fits)</span>
+          </label>
+        )}
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-muted-foreground">Visibility</span>
+          <div className="flex border border-border">
+            {(["network", "private"] as ServeVisibility[]).map((v) => (
+              <button
+                key={v}
+                type="button"
+                onClick={() => setVisibility(v)}
+                className={
+                  "px-2 py-1 text-[11px] uppercase tracking-wider " +
+                  (visibility === v ? "bg-secondary text-foreground" : "text-muted-foreground hover:bg-accent")
+                }
+              >
+                {v === "network" ? "Public" : "Private"}
+              </button>
+            ))}
+          </div>
+          <span className="text-muted-foreground">
+            {visibility === "network" ? "any peer can route here" : "direct / LAN only"}
+          </span>
+        </div>
+      </div>
+
+      <div className="flex justify-end">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => onServe({ forceSingle, userForced: forceCluster, visibility })}
+          className="tnz-eyebrow border border-border bg-primary px-3 py-1.5 text-primary-foreground hover:opacity-90 disabled:opacity-50"
+        >
+          {busy ? "Serving…" : willCluster ? `Serve across ${preview.stages.length} nodes` : "Serve on this machine"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function ServeFlow() {
   const local = useLocalModels();
   const [picked, setPicked] = useState<string | null>(null);
+  // Model id currently in the assisted cluster-setup panel (before serving).
+  const [previewing, setPreviewing] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -3160,19 +3523,57 @@ function ServeFlow() {
     ? Number(BigInt(stats.total_rewards_wei)) / 1e18
     : 0;
 
-  async function serve(modelId: string) {
+  async function serve(modelId: string, opts?: ServeOptions) {
     setBusy(true);
     setError(null);
     setSuccess(null);
     try {
+      // Ensure the node advertises the model_provider role before it
+      // registers as a provider, so peers route inference here. The node
+      // replaces its role set wholesale, so add to the live set rather
+      // than clobbering any validator/storage roles already served.
+      const cur = await invoke<NodeStatus | null>("node_status");
+      await invoke<string>("request_role_change", {
+        roles: withRole(cur?.roles, "model_provider"),
+      });
+      const serveParams: Record<string, unknown> = { model_id: modelId };
+      if (opts?.forceSingle) serveParams.force_single = true;
+      if (opts?.userForced) serveParams.user_forced = true;
+      serveParams.visibility = opts?.visibility ?? "network";
       await invoke<any>("rpc_call", {
-        args: { method: "tenzro_serveModel", params: { model_id: modelId } },
+        args: { method: "tenzro_serveModel", params: serveParams },
       });
       await invoke<any>("rpc_call", {
         args: { method: "tenzro_registerProvider", params: { model_id: modelId } },
       });
       setServing((s) => new Set(s).add(modelId));
-      setSuccess(`Serving ${modelId}. Other nodes can now route requests here.`);
+      const where = opts?.visibility === "private" ? "privately (direct/LAN only)" : "to the network";
+      setSuccess(`Serving ${modelId} ${where}.`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+      setPicked(null);
+      setPreviewing(null);
+    }
+  }
+
+  async function stopServing(modelId: string) {
+    setBusy(true);
+    setError(null);
+    setSuccess(null);
+    setPicked(modelId);
+    try {
+      const resp = await invoke<any>("rpc_call", {
+        args: { method: "tenzro_stopModel", params: { model_id: modelId } },
+      });
+      if (resp?.error) throw new Error(resp.error.message ?? "stop failed");
+      setServing((s) => {
+        const next = new Set(s);
+        next.delete(modelId);
+        return next;
+      });
+      setSuccess(`Stopped serving ${modelId}.`);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -3242,41 +3643,60 @@ function ServeFlow() {
         {downloaded.map((m) => {
           const live = providerCount.get(m.id) ?? 0;
           const isServing = serving.has(m.id);
+          const isPreviewing = previewing === m.id;
           return (
-            <li key={m.id} className="flex items-center justify-between gap-4 border border-border bg-card p-4">
-              <div className="min-w-0">
-                <div className="flex items-center gap-2 text-sm font-medium">
-                  {m.name}
-                  {isServing && (
-                    <span className="border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
-                      Serving
-                    </span>
-                  )}
-                </div>
-                <div className="mt-0.5 text-xs text-muted-foreground">
-                  {m.family} · {m.parameters} ·{" "}
-                  {m.context_length.toLocaleString()} ctx
-                  {live > 0 && (
-                    <>
-                      {" · "}
-                      <span className="text-foreground/70">
-                        {live} live provider{live === 1 ? "" : "s"}
+            <li key={m.id} className="border border-border bg-card">
+              <div className="flex items-center justify-between gap-4 p-4">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    {m.name}
+                    {isServing && (
+                      <span className="border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
+                        Serving
                       </span>
-                    </>
+                    )}
+                  </div>
+                  <div className="mt-0.5 text-xs text-muted-foreground">
+                    {m.family} · {m.parameters} ·{" "}
+                    {m.context_length.toLocaleString()} ctx
+                    {live > 0 && (
+                      <>
+                        {" · "}
+                        <span className="text-foreground/70">
+                          {live} live provider{live === 1 ? "" : "s"}
+                        </span>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {isServing && (
+                    <button
+                      type="button"
+                      onClick={() => stopServing(m.id)}
+                      disabled={busy && picked === m.id}
+                      className="tnz-eyebrow border border-border px-3 py-1.5 hover:border-destructive hover:text-destructive disabled:opacity-50"
+                    >
+                      {busy && picked === m.id ? "Stopping…" : "Stop"}
+                    </button>
                   )}
+                  <button
+                    type="button"
+                    onClick={() => setPreviewing(isPreviewing ? null : m.id)}
+                    disabled={busy}
+                    className="tnz-eyebrow border border-border bg-secondary px-3 py-1.5 text-secondary-foreground hover:bg-accent disabled:opacity-50"
+                  >
+                    {isPreviewing ? "Cancel" : isServing ? "Re-advertise" : "Serve to network"}
+                  </button>
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setPicked(m.id);
-                  serve(m.id);
-                }}
-                disabled={busy && picked === m.id}
-                className="border border-emerald-600/40 bg-emerald-600/10 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-emerald-600 dark:text-emerald-400 hover:bg-emerald-600/20 disabled:opacity-50"
-              >
-                {busy && picked === m.id ? "Serving…" : isServing ? "Re-advertise" : "Serve to network"}
-              </button>
+              {isPreviewing && (
+                <ClusterPreviewPanel
+                  modelId={m.id}
+                  busy={busy && picked === m.id}
+                  onServe={(opts) => { setPicked(m.id); serve(m.id, opts); }}
+                />
+              )}
             </li>
           );
         })}
@@ -3288,13 +3708,231 @@ function ServeFlow() {
 function StatBox({ label, value, hint }: { label: string; value: string; hint: string }) {
   return (
     <div className="border border-border bg-card p-4">
-      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-        {label}
+      <div className="tnz-eyebrow">{label}</div>
+      <div className="mt-2 font-mono text-2xl font-semibold tabular-nums tracking-tight">
+        {value}
       </div>
-      <div className="mt-1 font-mono text-2xl font-semibold">{value}</div>
-      <div className="mt-0.5 text-[10px] text-muted-foreground">{hint}</div>
+      <div className="mt-1 text-[11px] text-muted-foreground">{hint}</div>
     </div>
   );
+}
+
+/** What this machine can offer on the network. Mirrors `CapabilityReadout`
+ *  in tenzro-studio-core::hardware — the GUI never re-derives this policy. */
+interface CapabilityReadout {
+  ram_gb: number;
+  physical_cores: number;
+  gpu: string;
+  free_disk_gb: number;
+  offerable_storage_gb: number;
+  can_serve_ai: boolean;
+  can_serve_compute: boolean;
+  can_serve_storage: boolean;
+}
+
+/** Live storage-provider state (`tenzro_storageStatus`). */
+interface StorageStatus {
+  is_storage_provider: boolean;
+  effective_rate_wei: string;
+  object_count: number;
+}
+
+/** Live compute-provider state (`tenzro_computeStatus`). */
+interface ComputeStatus {
+  is_compute_provider: boolean;
+  effective_rate_wei: string;
+  active_rentals: number;
+}
+
+/** Provider onboarding for storage + compute. One node, one stake, many
+ *  roles: opting in adds the role to the live set without a restart, and the
+ *  node refuses any role its hardware can't back. Read the capability readout
+ *  first, then flip on whichever resources this machine can offer. */
+function ProvideFlow() {
+  const { status: wallet } = useWallet();
+  const [cap, setCap] = useState<CapabilityReadout | null>(null);
+  const [roles, setRoles] = useState<string>("");
+  const [storage, setStorage] = useState<StorageStatus | null>(null);
+  const [compute, setCompute] = useState<ComputeStatus | null>(null);
+  const [busy, setBusy] = useState<"storage" | "compute" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<CapabilityReadout>("capability_readout")
+      .then((c) => { if (!cancelled) setCap(c); })
+      .catch(() => { /* probe is best-effort */ });
+    const poll = async () => {
+      try {
+        const s = await invoke<NodeStatus | null>("node_status");
+        if (!cancelled && s) setRoles(s.roles);
+      } catch { /* node may be starting */ }
+      // Provider status RPCs error with -32004 until the role is active; we
+      // treat that as "not providing yet" rather than surfacing an error.
+      try {
+        const r = await rpc<StorageStatus>("tenzro_storageStatus");
+        if (!cancelled) setStorage(r);
+      } catch { if (!cancelled) setStorage(null); }
+      try {
+        const r = await rpc<ComputeStatus>("tenzro_computeStatus");
+        if (!cancelled) setCompute(r);
+      } catch { if (!cancelled) setCompute(null); }
+      if (!cancelled) setTimeout(poll, 5_000);
+    };
+    poll();
+    return () => { cancelled = true; };
+  }, []);
+
+  if (!wallet?.exists) return null;
+
+  const servesStorage = roles.includes("storage");
+  const servesCompute = roles.includes("ai") || roles.includes("model_provider");
+
+  async function enable(role: "storage" | "model_provider") {
+    setBusy(role === "storage" ? "storage" : "compute");
+    setError(null);
+    try {
+      const cur = await invoke<NodeStatus | null>("node_status");
+      await invoke<string>("request_role_change", {
+        roles: withRole(cur?.roles, role),
+      });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="space-y-8">
+      <section>
+        <p className="tnz-eyebrow mb-3">What your machine can offer</p>
+        {cap ? (
+          <div className="grid grid-cols-2 gap-px border border-border bg-border sm:grid-cols-4">
+            <StatBox label="Memory" value={`${cap.ram_gb} GB`} hint={`${cap.physical_cores} cores`} />
+            <StatBox label="Accelerator" value={cap.gpu} hint={cap.can_serve_ai ? "can serve AI" : "below AI floor"} />
+            <StatBox label="Free disk" value={`${cap.free_disk_gb} GB`} hint={`${cap.offerable_storage_gb} GB offerable`} />
+            <StatBox
+              label="Roles live"
+              value={roles ? formatRoles(roles) : "—"}
+              hint="one stake, many roles"
+            />
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">Reading hardware…</p>
+        )}
+      </section>
+
+      <section className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <ProvideResource
+          eyebrow="STO"
+          title="Host storage"
+          body="Offer spare disk to the network. You're paid per byte stored per epoch; a proof-of-retrievability challenge runs each epoch, and a miss stops the meter."
+          capable={cap?.can_serve_storage ?? false}
+          capableHint={cap ? `${cap.offerable_storage_gb} GB offerable after a safety reserve` : ""}
+          incapableHint="No spare disk beyond the safety reserve."
+          active={servesStorage}
+          busy={busy === "storage"}
+          status={
+            storage
+              ? `${storage.object_count} object${storage.object_count === 1 ? "" : "s"} · ${formatRateGiB(storage.effective_rate_wei)}`
+              : undefined
+          }
+          onEnable={() => enable("storage")}
+        />
+        <ProvideResource
+          eyebrow="CMP"
+          title="Rent out compute"
+          body="Offer CPU/GPU capacity for fixed-term rentals. You're paid per epoch; an availability proof gates each settlement so renters only pay for time you're actually reachable."
+          capable={cap?.can_serve_compute ?? false}
+          capableHint={cap ? `${cap.gpu} · ${cap.physical_cores} cores` : ""}
+          incapableHint="Below the compute floor."
+          active={servesCompute}
+          busy={busy === "compute"}
+          status={
+            compute
+              ? `${compute.active_rentals} active rental${compute.active_rentals === 1 ? "" : "s"} · ${formatRateEpoch(compute.effective_rate_wei)}`
+              : undefined
+          }
+          onEnable={() => enable("model_provider")}
+        />
+      </section>
+
+      {error && <ErrorBox title="Couldn't update provider role.">{error}</ErrorBox>}
+
+      <p className="text-xs text-muted-foreground/80">
+        Both services draw on the same provider stake and share one coverage
+        budget. Earnings settle into your wallet as epochs pass.
+      </p>
+    </div>
+  );
+}
+
+/** One provider resource card (storage or compute): capability gate, opt-in
+ *  toggle, and live status once active. */
+function ProvideResource({
+  eyebrow, title, body, capable, capableHint, incapableHint, active, busy, status, onEnable,
+}: {
+  eyebrow: string;
+  title: string;
+  body: string;
+  capable: boolean;
+  capableHint: string;
+  incapableHint: string;
+  active: boolean;
+  busy: boolean;
+  status?: string;
+  onEnable: () => void;
+}) {
+  return (
+    <div className="border border-border bg-card p-6">
+      <div className="flex items-center justify-between">
+        <p className="tnz-eyebrow">{eyebrow}</p>
+        {active && (
+          <span className="tnz-eyebrow text-[var(--brand)]">● Live</span>
+        )}
+      </div>
+      <h3 className="mt-3 text-lg font-medium tracking-tight">{title}</h3>
+      <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{body}</p>
+      <p className="mt-3 text-[11px] text-muted-foreground/80">
+        {capable ? capableHint : incapableHint}
+      </p>
+      {active ? (
+        <div className="mt-4 font-mono text-xs tabular-nums text-muted-foreground">
+          {status ?? "starting…"}
+        </div>
+      ) : (
+        <button
+          onClick={onEnable}
+          disabled={!capable || busy}
+          className="mt-4 border border-border bg-background px-4 py-2 text-sm transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {busy ? "Enabling…" : "Start providing"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Wei-per-byte-epoch → a readable TNZO/GiB/epoch figure. */
+function formatRateGiB(rateWei: string): string {
+  try {
+    const perGiBEpoch = (BigInt(rateWei) * 1073741824n);
+    const tnzo = Number(perGiBEpoch) / 1e18;
+    return `${tnzo.toPrecision(2)} TNZO / GiB·epoch`;
+  } catch {
+    return "rate —";
+  }
+}
+
+/** Wei-per-epoch → a readable TNZO/epoch figure. */
+function formatRateEpoch(rateWei: string): string {
+  try {
+    const tnzo = Number(BigInt(rateWei)) / 1e18;
+    return `${tnzo.toPrecision(2)} TNZO / epoch`;
+  } catch {
+    return "rate —";
+  }
 }
 
 /** Minimal Validator flow: deposit TNZO and submit a validator join
@@ -3343,6 +3981,12 @@ function ValidatorFlow() {
       const err = resp?.error;
       if (err) throw new Error(err.message ?? "deposit failed");
       setTxHash(resp?.result?.tx_hash ?? resp?.result ?? "pending");
+      // Stake settled — add the validator role to the live set so the node
+      // begins consensus participation without a restart, keeping any
+      // model_provider/storage roles it already serves under the one stake.
+      await invoke<string>("request_role_change", {
+        roles: withRole(nodeStatus?.roles, "validator"),
+      });
       setStep("submitted");
       refresh();
     } catch (e) {
@@ -3520,11 +4164,84 @@ function ValidatorFlow() {
               periods miss reward duties.
             </p>
           </div>
+          <ValidatorMonitorPanel />
           <ValidatorExitPanel onExited={() => setStep("preflight")} />
         </>
       )}
     </div>
   );
+}
+
+/** Live validator health while serving. Polls node_status every 5s and
+ *  surfaces the signals that determine reward eligibility: connectivity,
+ *  peer count, role, chain height, and uptime. A low peer count or a
+ *  non-connected state is flagged because sustained downtime forfeits
+ *  reward duties. */
+function ValidatorMonitorPanel() {
+  const [status, setStatus] = useState<NodeStatus | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const s = await invoke<NodeStatus | null>("node_status");
+        if (!cancelled && s) setStatus(s);
+      } catch { /* node may be mid-restart */ }
+      if (!cancelled) setTimeout(poll, 5_000);
+    };
+    poll();
+    return () => { cancelled = true; };
+  }, []);
+
+  const isValidator = status?.roles?.toLowerCase().includes("validator") ?? false;
+  const healthy = status?.connectivity === "connected" && (status?.peer_count ?? 0) > 0;
+
+  return (
+    <div className="border border-border bg-card p-6">
+      <div className="flex items-center justify-between">
+        <h4 className="text-sm font-semibold">Validator health</h4>
+        <span
+          className={`tnz-eyebrow ${healthy ? "text-foreground" : "text-destructive"}`}
+        >
+          {!status ? "Connecting" : healthy ? "Online" : "Degraded"}
+        </span>
+      </div>
+      <div className="mt-4 grid grid-cols-4 gap-3">
+        <StatBox
+          label="Connectivity"
+          value={status?.connectivity ?? "—"}
+          hint={isValidator ? "validator" : formatRoles(status?.roles)}
+        />
+        <StatBox
+          label="Peers"
+          value={String(status?.peer_count ?? "—")}
+          hint={(status?.peer_count ?? 0) > 0 ? "gossip reachable" : "no peers — at risk"}
+        />
+        <StatBox
+          label="Block height"
+          value={status?.block_height?.toLocaleString() ?? "—"}
+          hint="local chain tip"
+        />
+        <StatBox
+          label="Uptime"
+          value={status ? formatUptime(status.uptime_secs) : "—"}
+          hint="this session"
+        />
+      </div>
+      {status && !healthy && (
+        <p className="mt-3 text-xs text-destructive">
+          Node isn't fully connected. Validators that stay offline miss
+          reward duties — check your network connection.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function formatUptime(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+  return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`;
 }
 
 /** Exit / unbonding panel. Calls tenzro_unstake which queues the
