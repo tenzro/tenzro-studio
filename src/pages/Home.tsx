@@ -177,7 +177,7 @@ interface DownloadProgress {
   error?: string | null;
 }
 
-type CardId = "use-network" | "run-local" | "serve" | "provide" | "validate";
+type CardId = "use-network" | "run-local" | "serve" | "provide" | "validate" | "cluster";
 
 interface Card {
   id: CardId;
@@ -226,6 +226,14 @@ const CARDS: Card[] = [
     body:
       "Advanced. Deposit TNZO, help secure the network, " +
       "earn validator rewards. Requires uptime + a refundable deposit.",
+  },
+  {
+    id: "cluster",
+    title: "Pool a local network",
+    tagline: "Stitch nearby machines into one big node",
+    body:
+      "Find the Tenzro nodes on your LAN and pool their memory into a " +
+      "single cluster — run models too large for any one machine.",
   },
 ];
 
@@ -279,6 +287,7 @@ export default function Home() {
         <CardFlow
           cardId={picked}
           onBack={() => setPicked(null)}
+          onNavigate={setPicked}
           status={status}
         />
       </WalletProvider>
@@ -349,6 +358,7 @@ function cardGlyph(id: CardId): string {
     case "serve": return "SRV";
     case "provide": return "PRV";
     case "validate": return "VAL";
+    case "cluster": return "LAN";
   }
 }
 
@@ -680,10 +690,11 @@ function WalletChip() {
 interface CardFlowProps {
   cardId: CardId;
   onBack: () => void;
+  onNavigate: (id: CardId) => void;
   status: NodeStatus | null;
 }
 
-function CardFlow({ cardId, onBack, status }: CardFlowProps) {
+function CardFlow({ cardId, onBack, onNavigate, status }: CardFlowProps) {
   const card = CARDS.find((c) => c.id === cardId)!;
   return (
     <div className="tnz-ambient flex min-h-screen flex-col">
@@ -718,6 +729,11 @@ function CardFlow({ cardId, onBack, status }: CardFlowProps) {
           {cardId === "validate" && (
             <RequireWallet reason="You need a wallet to deposit TNZO and receive validator rewards.">
               <ValidatorFlow />
+            </RequireWallet>
+          )}
+          {cardId === "cluster" && (
+            <RequireWallet reason="You need a wallet to serve a clustered model and receive TNZO from inference routed to the pool.">
+              <MeshFlow onServe={() => onNavigate("serve")} />
             </RequireWallet>
           )}
         </div>
@@ -883,6 +899,11 @@ function useLocalModels() {
 function useSidecarReady() {
   const [ready, setReady] = useState(false);
   const [loading, setLoading] = useState(false);
+  // Mirror `ready` in a ref so the setTimeout-chained poll reads the live
+  // value: the effect runs once (deps []), so the closure's `ready` is
+  // frozen at the first render (always false) and the back-off below would
+  // otherwise busy-poll at 1s forever.
+  const readyRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -898,15 +919,18 @@ function useSidecarReady() {
         }>("sidecar_status");
         if (cancelled) return;
         const alive = !!s?.alive;
-        setReady(alive && s?.http_status === 200);
+        const isReady = alive && s?.http_status === 200;
+        readyRef.current = isReady;
+        setReady(isReady);
         setLoading(alive && s?.http_status === 503);
       } catch {
         if (cancelled) return;
+        readyRef.current = false;
         setReady(false);
         setLoading(false);
       }
       // Poll faster until ready, then back off to a light heartbeat.
-      timer = setTimeout(poll, ready ? 5_000 : 1_000);
+      timer = setTimeout(poll, readyRef.current ? 5_000 : 1_000);
     };
 
     poll();
@@ -3473,6 +3497,173 @@ function ClusterPreviewPanel({
           className="tnz-eyebrow border border-border bg-primary px-3 py-1.5 text-primary-foreground hover:opacity-90 disabled:opacity-50"
         >
           {busy ? "Serving…" : willCluster ? `Serve across ${preview.stages.length} nodes` : "Serve on this machine"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** A single member returned by `tenzro_clusterMembers` — the same shape the
+ *  cluster planner discovers, minus the per-model fit fields. */
+type MeshMember = {
+  address: string;
+  vram_gb: number;
+  backend: string;
+  cap_key: string;
+  reachability: string;
+  is_head: boolean;
+};
+type MeshSnapshot = {
+  members: MeshMember[];
+  member_count: number;
+  local_count: number;
+  total_vram_gb: number;
+};
+
+/** Discovery-first view of the local mesh. Polls `tenzro_clusterMembers`
+ *  (no model required) so the user sees the nodes on their LAN and the
+ *  memory they pool *before* committing to serve anything. Handing off to
+ *  the Serve path is where an actual model gets stitched across them. */
+function MeshFlow({ onServe }: { onServe: () => void }) {
+  const [snap, setSnap] = useState<MeshSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const resp = await invoke<any>("rpc_call", {
+          args: { method: "tenzro_clusterMembers", params: {} },
+        });
+        if (cancelled) return;
+        if (resp?.error) { setError(resp.error.message ?? "discovery failed"); }
+        else { setError(null); setSnap(resp?.result ?? null); }
+      } catch (e) {
+        if (!cancelled) setError(String(e));
+      }
+      // mDNS discovery is continuous — re-poll so peers appear/disappear
+      // live as machines join or leave the segment.
+      if (!cancelled) setTimeout(poll, 4_000);
+    };
+    poll();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Members reachable on the same LAN segment are the pool that can actually
+  // form a data-plane cluster; remote/relay peers can't carry pipeline
+  // activations, so they're shown but not counted toward the pool.
+  const local = snap?.members.filter((m) => m.reachability === "local_direct") ?? [];
+  const others = snap?.members.filter((m) => m.reachability !== "local_direct") ?? [];
+  const pooledVram = local.reduce((sum, m) => sum + m.vram_gb, 0);
+  const peerCount = Math.max(0, local.length - 1); // excludes this machine
+
+  return (
+    <div className="space-y-8">
+      {/* Pool headline — the signature of this flow: how much memory the
+          LAN adds up to, the one number that makes clustering worth it. */}
+      <div className="grid grid-cols-1 gap-px border border-border bg-border sm:grid-cols-3">
+        <StatBox
+          label="On your network"
+          value={local.length === 0 ? "—" : String(local.length)}
+          hint={local.length === 0 ? "scanning the LAN…" : `${peerCount} peer${peerCount === 1 ? "" : "s"} + this machine`}
+        />
+        <StatBox
+          label="Pooled memory"
+          value={local.length === 0 ? "—" : `${pooledVram.toFixed(0)} GB`}
+          hint="combined serving memory across the pool"
+        />
+        <StatBox
+          label="Reachable elsewhere"
+          value={others.length === 0 ? "0" : String(others.length)}
+          hint="direct/relay peers — can't join a LAN pipeline"
+        />
+      </div>
+
+      {error && (
+        <p className="text-xs text-destructive">Couldn’t reach the node: {error}</p>
+      )}
+
+      {/* Discovered LAN members. */}
+      <div>
+        <p className="tnz-eyebrow mb-3">On this network</p>
+        {snap == null ? (
+          <div className="border border-border bg-card p-6 text-sm text-muted-foreground">
+            Listening for Tenzro nodes on your local network…
+          </div>
+        ) : local.length === 0 ? (
+          <div className="border border-border bg-card p-6">
+            <h3 className="text-sm font-semibold">No other machines found yet</h3>
+            <p className="mt-1 text-sm text-muted-foreground">
+              This machine is the only Tenzro node on the segment so far. Open
+              Tenzro Studio on another computer on the same Wi-Fi or switch — it
+              will appear here within a few seconds. You can still serve a model
+              on this machine alone.
+            </p>
+          </div>
+        ) : (
+          <ul className="divide-y divide-border border border-border bg-card">
+            {local.map((m) => (
+              <li key={m.address} className="flex items-center justify-between gap-4 p-4">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium">
+                      {m.is_head ? "This machine" : shortAddr(m.address)}
+                    </span>
+                    {m.is_head && (
+                      <span className="tnz-eyebrow border border-border px-1.5 py-0.5 text-[10px]">
+                        head
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+                    {m.backend} · {m.cap_key}
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-4 text-right">
+                  <span className="font-mono text-sm tabular-nums">{m.vram_gb.toFixed(0)} GB</span>
+                  <span className="tnz-eyebrow text-[10px] text-muted-foreground">
+                    {reachLabel(m.reachability)}
+                  </span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {/* Remote peers that advertised a cluster profile but aren't LAN-local. */}
+      {others.length > 0 && (
+        <div>
+          <p className="tnz-eyebrow mb-3">Reachable but off-LAN</p>
+          <ul className="divide-y divide-border border border-border bg-card">
+            {others.map((m) => (
+              <li key={m.address} className="flex items-center justify-between gap-4 p-4 text-muted-foreground">
+                <span className="font-mono text-sm">{shortAddr(m.address)}</span>
+                <span className="tnz-eyebrow text-[10px]">{reachLabel(m.reachability)}</span>
+              </li>
+            ))}
+          </ul>
+          <p className="mt-2 text-[11px] text-muted-foreground/80">
+            Layer pipelines need a direct data-plane link, so these peers can’t
+            join the pool — they route inference the normal way instead.
+          </p>
+        </div>
+      )}
+
+      {/* Hand off to the Serve path, where a chosen model actually gets
+          stitched across the pool via the cluster preview. */}
+      <div className="flex items-center justify-between border-t border-border pt-6">
+        <p className="max-w-md text-sm text-muted-foreground">
+          The pool is live as soon as the machines are on the network. To put it
+          to work, serve a model — Tenzro splits it across the pool automatically
+          when it’s too big for one machine.
+        </p>
+        <button
+          type="button"
+          onClick={onServe}
+          className="tnz-eyebrow shrink-0 border border-border bg-primary px-3 py-1.5 text-primary-foreground hover:opacity-90"
+        >
+          Serve a model →
         </button>
       </div>
     </div>
