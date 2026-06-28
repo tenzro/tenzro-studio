@@ -5,6 +5,8 @@ import {
   searchConversations,
   listProjects,
   createProject,
+  renameProject,
+  deleteProject,
   assignConversationToProject,
   type ConversationRow,
   type ProjectRow,
@@ -88,6 +90,43 @@ export function ConversationSidebar({
     }
   }
 
+  async function renameSelectedProject(projectId: string) {
+    const current = projects.find((p) => p.id === projectId);
+    const name = window.prompt("Rename project:", current?.name ?? "");
+    if (!name?.trim() || name.trim() === current?.name) return;
+    try {
+      await renameProject(projectId, name.trim());
+      setProjects((p) =>
+        p.map((proj) =>
+          proj.id === projectId ? { ...proj, name: name.trim() } : proj,
+        ),
+      );
+    } catch (e) {
+      console.warn("renameProject failed:", e);
+    }
+  }
+
+  async function deleteSelectedProject(projectId: string) {
+    const current = projects.find((p) => p.id === projectId);
+    // Destructive: the DB cascade removes the project's chats + messages.
+    let ok = false;
+    const msg = `Delete "${current?.name ?? "project"}" and all its chats? This can't be undone.`;
+    try {
+      const { confirm } = await import("@tauri-apps/plugin-dialog");
+      ok = await confirm(msg, { title: "Delete project", kind: "warning" });
+    } catch {
+      ok = window.confirm(msg);
+    }
+    if (!ok) return;
+    try {
+      await deleteProject(projectId);
+      setProjects((p) => p.filter((proj) => proj.id !== projectId));
+      setProjectFilter("all");
+    } catch (e) {
+      console.warn("deleteProject failed:", e);
+    }
+  }
+
   async function moveToProject(conversationId: string, projectId: string | null) {
     try {
       await assignConversationToProject(conversationId, projectId);
@@ -160,6 +199,27 @@ export function ConversationSidebar({
             +
           </button>
         </div>
+        {/* Rename / delete the currently-selected project. Only shown
+            when a real project (not All / Unfiled) is in focus. */}
+        {projectFilter !== "all" && projectFilter !== "unfiled" && (
+          <div className="flex items-center gap-2 px-0.5">
+            <button
+              type="button"
+              onClick={() => renameSelectedProject(projectFilter)}
+              className="tnz-eyebrow hover:text-foreground"
+            >
+              Rename
+            </button>
+            <span className="text-muted-foreground/40">·</span>
+            <button
+              type="button"
+              onClick={() => deleteSelectedProject(projectFilter)}
+              className="tnz-eyebrow hover:text-destructive"
+            >
+              Delete
+            </button>
+          </div>
+        )}
       </div>
       <ul className="overflow-y-auto p-2" style={{ maxHeight: "calc(100vh - 200px)" }}>
         {rows == null && (

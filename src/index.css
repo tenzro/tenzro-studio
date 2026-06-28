@@ -1,6 +1,16 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
+/* Geist — bundled offline (no CDN) to match tenzro.com's display/body
+ * face. Weights 400/500/600/700 cover headline + body; mono carries the
+ * uppercase eyebrow + data labels. */
+@import "@fontsource/geist-sans/400.css";
+@import "@fontsource/geist-sans/500.css";
+@import "@fontsource/geist-sans/600.css";
+@import "@fontsource/geist-sans/700.css";
+@import "@fontsource/geist-mono/400.css";
+@import "@fontsource/geist-mono/500.css";
+
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
@@ -23,58 +33,71 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: var(--radius);
+  --radius-md: var(--radius);
   --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --radius-xl: var(--radius);
+  --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, monospace;
 }
 
-/* Monochromatic OKLCH theme — matches the broader Tenzro UI language. */
+/* ── Tenzro design language ───────────────────────────────────────────
+ * Derived from tenzro.com: true-black canvas, white text, muted-gray
+ * secondary, sharp corners (radius 0). The one brand color is a
+ * desaturated periwinkle-indigo (#6B79AA) sampled from the hero's
+ * ambient glow. It is used deliberately sparingly — focus rings, a
+ * single active-state hairline, and the hero atmosphere — never as a
+ * button fill or to colour data. Black/white/gray carry the UI. */
 :root {
   --radius: 0px;
-  --background: oklch(0.98 0 0);
-  --foreground: oklch(0.14 0 0);
-  --card: oklch(1.0 0 0);
-  --card-foreground: oklch(0.14 0 0);
-  --popover: oklch(1.0 0 0);
-  --popover-foreground: oklch(0.14 0 0);
-  --primary: oklch(0.14 0 0);
-  --primary-foreground: oklch(0.98 0 0);
-  --secondary: oklch(0.93 0 0);
-  --secondary-foreground: oklch(0.14 0 0);
-  --muted: oklch(0.93 0 0);
-  --muted-foreground: oklch(0.45 0 0);
-  --accent: oklch(0.93 0 0);
-  --accent-foreground: oklch(0.14 0 0);
+
+  /* Light: clean inverse of the brand canvas. */
+  --background: #ffffff;
+  --foreground: #0a0c12;
+  --card: #ffffff;
+  --card-foreground: #0a0c12;
+  --popover: #ffffff;
+  --popover-foreground: #0a0c12;
+  --primary: #0a0c12;
+  --primary-foreground: #ffffff;
+  --secondary: #f2f3f5;
+  --secondary-foreground: #0a0c12;
+  --muted: #f2f3f5;
+  --muted-foreground: #5b6070;
+  --accent: #f2f3f5;
+  --accent-foreground: #0a0c12;
   --destructive: oklch(0.55 0.20 27);
-  --destructive-foreground: oklch(0.98 0 0);
-  --border: oklch(0.88 0 0);
-  --input: oklch(0.88 0 0);
-  --ring: oklch(0.65 0 0);
+  --destructive-foreground: #ffffff;
+  --border: #e3e5ea;
+  --input: #e3e5ea;
+  --ring: #6b79aa;
+
+  /* Brand periwinkle + its ambient-glow tints (theme-independent). */
+  --brand: #6b79aa;
+  --brand-soft: rgba(107, 121, 170, 0.14);
 }
 
 .dark {
-  --background: oklch(0.10 0 0);
-  --foreground: oklch(0.96 0 0);
-  --card: oklch(0.14 0 0);
-  --card-foreground: oklch(0.96 0 0);
-  --popover: oklch(0.14 0 0);
-  --popover-foreground: oklch(0.96 0 0);
-  --primary: oklch(0.96 0 0);
-  --primary-foreground: oklch(0.14 0 0);
-  --secondary: oklch(0.20 0 0);
-  --secondary-foreground: oklch(0.96 0 0);
-  --muted: oklch(0.20 0 0);
-  --muted-foreground: oklch(0.65 0 0);
-  --accent: oklch(0.20 0 0);
-  --accent-foreground: oklch(0.96 0 0);
-  --destructive: oklch(0.55 0.20 27);
-  --destructive-foreground: oklch(0.96 0 0);
-  --border: oklch(0.25 0 0);
-  --input: oklch(0.25 0 0);
-  --ring: oklch(0.45 0 0);
+  /* The brand canvas: pure black, like tenzro.com. */
+  --background: #000000;
+  --foreground: #ffffff;
+  --card: #0a0c12;
+  --card-foreground: #ffffff;
+  --popover: #0a0c12;
+  --popover-foreground: #ffffff;
+  --primary: #ffffff;
+  --primary-foreground: #000000;
+  --secondary: #14171f;
+  --secondary-foreground: #ffffff;
+  --muted: #14171f;
+  --muted-foreground: #8a8f9e;
+  --accent: #14171f;
+  --accent-foreground: #ffffff;
+  --destructive: oklch(0.62 0.20 27);
+  --destructive-foreground: #ffffff;
+  --border: #1c2030;
+  --input: #1c2030;
+  --ring: #6b79aa;
 }
 
 html,
@@ -91,26 +114,66 @@ body {
   background: var(--background);
 }
 
-/* The 28px native-titlebar drag region. Anything with
- * `data-tauri-drag-region` (and no interactive child) drags the
- * window. The 19/24 traffic-light offset in tauri.conf.json fits
- * inside this 28px band. */
+/* ── Signature: ambient periwinkle glow ───────────────────────────────
+ * A single soft radial bloom bleeding out of the black, the way the
+ * tenzro.com hero does. Applied to the home backdrop only — the one
+ * place the brand colour is allowed to breathe. Fixed + behind content
+ * so scrolling feels like moving through atmosphere, not over a sticker.
+ * Disabled in light mode where it would muddy the white. */
+.tnz-ambient {
+  position: relative;
+  isolation: isolate;
+}
+.dark .tnz-ambient::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(115% 75% at 72% 0%, rgba(107, 121, 170, 0.30) 0%, rgba(107, 121, 170, 0.10) 34%, transparent 64%);
+}
+
+/* Eyebrow label — mono, uppercase, wide tracking, muted. The structural
+ * device tenzro.com uses above every headline. */
+.tnz-eyebrow {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 0.6875rem;
+  font-weight: 500;
+  color: var(--muted-foreground);
+}
+
+/* Two-tone headline — the signature type move: full-weight white lead,
+ * muted continuation. Wrap the muted half in <span class="tnz-dim">. */
+.tnz-dim {
+  color: var(--muted-foreground);
+}
+
+/* The 28px native-titlebar drag region. */
 .title-drag-region {
   height: 28px;
   width: 100%;
   flex-shrink: 0;
 }
 
-/* Global focus-visible ring on interactive elements. Tailwind v4
- * inlines the `--ring` token from the theme so this works in both
- * light + dark modes. Uses outline (not box-shadow) so it stays
- * sharp on the vibrancy background. */
+/* Keyboard focus ring — the one consistent place the brand periwinkle
+ * appears on interactive elements. Outline (not box-shadow) stays sharp
+ * over the vibrancy background. */
 :focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
-/* Remove the outline on non-keyboard focus so mouse clicks stay
- * clean (matches Linear / Cursor behaviour). */
 :focus:not(:focus-visible) {
   outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
 }

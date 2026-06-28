@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import qrcodeGenerator from "qrcode-generator";
 import {
   getCurrentHeader,
   getSyncStatus,
@@ -493,20 +494,59 @@ function shortAddress(addr: string | undefined): string {
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
 }
 
-/** Tiny self-contained QR using the simplest available pure-CSS dot
- *  pattern fallback. We don't ship a heavy QR lib for one address. */
+/** Real QR for the wallet address, rendered as a crisp SVG. Uses the
+ *  bundled `qrcode-generator` encoder (pure JS, no network) so it works
+ *  offline. Modules paint in `currentColor` so the QR inherits the
+ *  foreground colour and reads in both themes. */
 function QRCode({ value }: { value: string }) {
-  // Render a Google Charts-quality QR via a public-domain QR encoder
-  // CDN is heavyweight; just show the address visually as a copy-target.
-  // Future: vendor `qrcode-generator` if visual QR is critical.
+  const path = useMemo(() => {
+    if (!value) return null;
+    try {
+      const qr = qrcodeGenerator(0, "M");
+      qr.addData(value);
+      qr.make();
+      const count = qr.getModuleCount();
+      let d = "";
+      for (let row = 0; row < count; row++) {
+        for (let col = 0; col < count; col++) {
+          if (qr.isDark(row, col)) {
+            d += `M${col} ${row}h1v1h-1z`;
+          }
+        }
+      }
+      return { d, count };
+    } catch {
+      return null;
+    }
+  }, [value]);
+
   return (
-    <div className="border border-border bg-secondary p-3 text-center">
-      <code className="break-all text-[10px] font-mono text-muted-foreground">
+    <div className="flex flex-col items-center gap-3 border border-border bg-card p-4">
+      {path ? (
+        <svg
+          viewBox={`-2 -2 ${path.count + 4} ${path.count + 4}`}
+          className="h-40 w-40 text-foreground"
+          role="img"
+          aria-label="Wallet address QR code"
+          shapeRendering="crispEdges"
+        >
+          <rect
+            x={-2}
+            y={-2}
+            width={path.count + 4}
+            height={path.count + 4}
+            className="fill-background"
+          />
+          <path d={path.d} fill="currentColor" />
+        </svg>
+      ) : (
+        <div className="flex h-40 w-40 items-center justify-center text-xs text-muted-foreground">
+          No address yet
+        </div>
+      )}
+      <code className="break-all text-center text-[10px] font-mono text-muted-foreground">
         {value}
       </code>
-      <div className="mt-2 text-[10px] text-muted-foreground/70">
-        Use Copy to share this address. (Visual QR shipping in a later release.)
-      </div>
     </div>
   );
 }
