@@ -4,7 +4,8 @@
 //! lives in `tenzro-studio-core::node_lifecycle` so the GUI and the
 //! headless CLI run the same code. This module only wraps those
 //! functions in Tauri command handlers (so the frontend's `invoke(...)`
-//! still works) and keeps the GUI-only `request_role_change` stub.
+//! still works) plus the GUI-only `request_role_change` wrapper, which
+//! dispatches the node's `tenzro_setRole` RPC.
 //!
 //! `auto_start_node` is re-exported (not wrapped) because `lib.rs` calls
 //! it directly from the setup hook, not via `invoke`.
@@ -22,26 +23,42 @@ pub async fn node_status(state: State<'_, AppState>) -> Result<Option<NodeStatus
     Ok(tenzro_studio_core::node_lifecycle::node_status(&state).await)
 }
 
-/// Switch the node's active role. Used by the "Serve AI" card to flip
-/// from ModelProvider-default to ModelProvider-with-serving (no role
-/// change needed, just inference router advertisement) and by the
-/// "Validator" card to upgrade to consensus participation.
+/// Switch the node's active runtime role. The "Serve AI" card flips to
+/// `model_provider` and the "Validator" card to `validator`. Backed by
+/// the node's `tenzro_setRole` RPC, which swaps the live `runtime_role`
+/// and gossips the change on the status topic — no restart required.
 ///
-/// Wave-1 implementation: only validates the request shape. Role
-/// changes that require a node restart (Validator opt-in) need a
-/// separate `restart_with_role` command that lands alongside the
-/// staking flow. This stays GUI-side because the headless CLI exposes
-/// the role choice through its own `serve --role` flag instead.
+/// `roles` is the full set the node should serve, since one node can serve
+/// any combination under one stake. Accepts a comma-separated string
+/// (`"validator,ai,storage"`) or the node's role names: `validator`,
+/// `model_provider`/`ai`, `tee_provider`/`tee`, `storage`, `full_node`,
+/// `light_client`. Returns the resolved role set on success.
 #[tauri::command]
 pub async fn request_role_change(
-    _role: String,
-    _state: State<'_, AppState>,
-) -> Result<(), String> {
-    // Wave-1 stub. The serving + validator flows in the UI cards
-    // dispatch this command but the actual restart-with-new-role path
-    // lands when the staking + provider-registration flows are wired
-    // in their own commits.
-    Err("Role change not yet implemented in this wave".to_string())
+    roles: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let args = tenzro_studio_core::rpc_bridge::RpcCallArgs {
+        method: "tenzro_setRole".to_string(),
+        params: serde_json::json!({ "roles": roles }),
+        admin_token: None,
+        api_key: None,
+    };
+    let resp = tenzro_studio_core::rpc_bridge::rpc_call(args, &state).await?;
+
+    if let Some(err) = resp.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("role change failed");
+        return Err(msg.to_string());
+    }
+    Ok(resp
+        .get("result")
+        .and_then(|r| r.get("roles"))
+        .and_then(|r| r.as_str())
+        .unwrap_or(&roles)
+        .to_string())
 }
 
 /// Wipe local chain state and restart the node. Required after a

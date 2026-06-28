@@ -91,6 +91,14 @@ pub fn hardware_profile() -> Value {
     tenzro_studio_core::rpc_bridge::hardware_profile()
 }
 
+/// What this machine can offer on the network (serve AI, rent out compute,
+/// host storage) plus the headroom behind each. The UI shows this before a
+/// user opts into providing.
+#[tauri::command]
+pub fn capability_readout() -> Value {
+    tenzro_studio_core::rpc_bridge::capability_readout()
+}
+
 #[tauri::command]
 pub async fn model_details(id: String, state: State<'_, AppState>) -> Result<Value, String> {
     tenzro_studio_core::rpc_bridge::model_details(id, &state).await
