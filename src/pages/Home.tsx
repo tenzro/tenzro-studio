@@ -3518,7 +3518,20 @@ type MeshSnapshot = {
   member_count: number;
   local_count: number;
   total_vram_gb: number;
+  self_peer_id: string | null;
+  lan_addresses: string[];
 };
+
+/** Pull the bare IP out of a libp2p multiaddr like
+ *  `/ip4/192.168.50.44/tcp/9000` → `192.168.50.44`. Falls back to the raw
+ *  string if it doesn't match, so the user always sees *something*. */
+function lanIp(addrs: string[]): string | null {
+  for (const a of addrs) {
+    const m = a.match(/\/ip4\/([0-9.]+)\//);
+    if (m && m[1] !== "0.0.0.0") return m[1];
+  }
+  return null;
+}
 
 /** Discovery-first view of the local mesh. Polls `tenzro_clusterMembers`
  *  (no model required) so the user sees the nodes on their LAN and the
@@ -3527,10 +3540,19 @@ type MeshSnapshot = {
 function MeshFlow({ onServe }: { onServe: () => void }) {
   const [snap, setSnap] = useState<MeshSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // "scanning" while a poll is in flight, "live" once a snapshot is back.
+  // Drives the status line so an empty LAN reads as working, not stuck.
+  const [scanning, setScanning] = useState(true);
+  const [lastScan, setLastScan] = useState<number | null>(null);
+  // Bumped by the Rescan button to force an immediate poll outside the
+  // 4s cadence. The poll loop keys its scheduling off the latest value.
+  const [rescanNonce, setRescanNonce] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const poll = async () => {
+      setScanning(true);
       try {
         const resp = await invoke<any>("rpc_call", {
           args: { method: "tenzro_clusterMembers", params: {} },
@@ -3540,14 +3562,22 @@ function MeshFlow({ onServe }: { onServe: () => void }) {
         else { setError(null); setSnap(resp?.result ?? null); }
       } catch (e) {
         if (!cancelled) setError(String(e));
+      } finally {
+        if (!cancelled) {
+          setScanning(false);
+          setLastScan(Date.now());
+        }
       }
       // mDNS discovery is continuous — re-poll so peers appear/disappear
       // live as machines join or leave the segment.
-      if (!cancelled) setTimeout(poll, 4_000);
+      if (!cancelled) timer = setTimeout(poll, 4_000);
     };
     poll();
-    return () => { cancelled = true; };
-  }, []);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [rescanNonce]);
 
   // Members reachable on the same LAN segment are the pool that can actually
   // form a data-plane cluster; remote/relay peers can't carry pipeline
@@ -3556,9 +3586,76 @@ function MeshFlow({ onServe }: { onServe: () => void }) {
   const others = snap?.members.filter((m) => m.reachability !== "local_direct") ?? [];
   const pooledVram = local.reduce((sum, m) => sum + m.vram_gb, 0);
   const peerCount = Math.max(0, local.length - 1); // excludes this machine
+  const ip = snap ? lanIp(snap.lan_addresses) : null;
+
+  // One-line plain-language summary of the live discovery state.
+  const statusText = error
+    ? "Discovery error — node unreachable"
+    : snap == null
+      ? "Starting discovery…"
+      : peerCount > 0
+        ? `Found ${peerCount} other machine${peerCount === 1 ? "" : "s"} on your network`
+        : ip
+          ? `Advertising on ${ip} — no other Tenzro machines found yet`
+          : "Listening for Tenzro machines on your network…";
 
   return (
     <div className="space-y-8">
+      {/* Live discovery status — the answer to "is this thing even doing
+          anything?". Always present so an empty pool never looks frozen. */}
+      <div className="flex items-center justify-between gap-4 border border-border bg-card px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span
+            className={`inline-block h-2 w-2 shrink-0 rounded-full ${
+              error ? "bg-destructive" : scanning ? "animate-pulse bg-primary" : "bg-primary"
+            }`}
+            aria-hidden
+          />
+          <div className="min-w-0">
+            <p className="truncate text-sm">{statusText}</p>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">
+              {scanning
+                ? "Scanning the local network…"
+                : lastScan
+                  ? `Auto-refreshes every 4s · last checked ${new Date(lastScan).toLocaleTimeString()}`
+                  : "Auto-refreshes every 4s"}
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => setRescanNonce((n) => n + 1)}
+          disabled={scanning}
+          className="tnz-eyebrow shrink-0 border border-border px-3 py-1.5 hover:bg-muted disabled:opacity-50"
+        >
+          {scanning ? "Scanning…" : "Rescan network"}
+        </button>
+      </div>
+
+      {/* This machine — proof the local node is on the network and findable
+          by others, with the exact address it advertises. */}
+      {snap && (
+        <div className="border border-border bg-card p-4">
+          <p className="tnz-eyebrow mb-2">This machine</p>
+          <div className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
+            <div>
+              <span className="text-muted-foreground">LAN address: </span>
+              <span className="font-mono text-[12px]">{ip ?? "—"}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Pool memory: </span>
+              <span className="font-mono text-[12px]">{pooledVram.toFixed(0)} GB</span>
+            </div>
+            <div className="sm:col-span-2">
+              <span className="text-muted-foreground">Node ID: </span>
+              <span className="font-mono text-[11px] break-all">
+                {snap.self_peer_id ?? "—"}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Pool headline — the signature of this flow: how much memory the
           LAN adds up to, the one number that makes clustering worth it. */}
       <div className="grid grid-cols-1 gap-px border border-border bg-border sm:grid-cols-3">
@@ -3582,6 +3679,20 @@ function MeshFlow({ onServe }: { onServe: () => void }) {
       {error && (
         <p className="text-xs text-destructive">Couldn’t reach the node: {error}</p>
       )}
+
+      {/* How to add a machine — the one action the user can take to grow the
+          pool, stated plainly so an empty network is a next step, not a wall. */}
+      <div className="border border-dashed border-border bg-muted/30 p-4">
+        <p className="text-sm">
+          <span className="font-medium">Add a machine to the pool: </span>
+          <span className="text-muted-foreground">
+            run Tenzro Studio (or the headless node) on another computer on this
+            same Wi-Fi or LAN. It’s discovered automatically — no setup, no codes
+            to copy. Nothing to scan for if there are no other Tenzro machines on
+            the network yet.
+          </span>
+        </p>
+      </div>
 
       {/* Discovered LAN members. */}
       <div>
